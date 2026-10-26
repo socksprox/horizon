@@ -17,6 +17,7 @@ use horizon_client::{
 };
 use horizon_core::geometry::Vec3;
 use horizon_protocol::packets::{configuration as cfg, play};
+use horizon_world::nbt::{Compound, Tag};
 
 /// How far past a portal's bounds a crossing still counts: the player's
 /// 0.6m box, halved, plus a step.
@@ -98,6 +99,45 @@ impl Game<'_> {
     pub(super) fn set_remote_portals(&mut self, list: Vec<Portal>) {
         self.imm_portals = list;
         self.portal_sync_dirty = false;
+    }
+
+    /// `data/horizon_imm_portals.dat` in the world folder (like
+    /// `nether_portal.rs`'s arrivals file).
+    fn imm_portals_path(&self) -> std::path::PathBuf {
+        self.world_root
+            .join("data")
+            .join("horizon_imm_portals.dat")
+    }
+    /// A level's portals when it opens (`open_level`): every level keeps
+    /// its list in the one file, tagged by dimension.
+    pub(super) fn load_imm_portals(&self, dim: Dim) -> Vec<Portal> {
+        let Some(root) = horizon_client::save::read_dat(&self.imm_portals_path())
+        else {
+            return Vec::new();
+        };
+        let Some(Tag::List(list)) = root.get("portals") else {
+            return Vec::new();
+        };
+        list.iter()
+            .filter_map(portal_from_tag)
+            .filter(|p| p.dim == dim.id())
+            .collect()
+    }
+    /// Every level's portals (`save_game_metadata`): the open level's
+    /// plus each parked level's.
+    pub(super) fn save_imm_portals(&mut self) {
+        if self.remote.is_some() {
+            return;
+        }
+        let mut list: Vec<Tag> = self.imm_portals.iter().map(portal_to_tag).collect();
+        for p in self.levels.parked_portals() {
+            list.push(portal_to_tag(p));
+        }
+        let root = Tag::compound([("portals", Tag::List(list))]);
+        if let Err(e) = horizon_client::save::write_dat(&self.imm_portals_path(), root)
+        {
+            log::warn!("Horizon: saving portals failed: {e}");
+        }
     }
 
     /// Whether `from -> to` (bounding-box centres) entered a portal in
@@ -362,6 +402,54 @@ impl Game<'_> {
         }
         !out.iter().all(|&b| b)
     }
+}
+
+/// A portal as NBT for `horizon_imm_portals.dat`.
+fn portal_to_tag(p: &Portal) -> Tag {
+    let mut t = Compound::new();
+    t.insert("id".into(), Tag::Int(p.id as i32));
+    t.insert("dim".into(), Tag::String(p.dim.as_str().into()));
+    t.insert("dest".into(), Tag::String(p.dest_dim.as_str().into()));
+    let put = |t: &mut Compound, key: &str, v: Vec3| {
+        for (k, c) in v.components().iter().enumerate() {
+            t.insert(format!("{key}{k}").as_str().into(), Tag::Double(c.to_bits()));
+        }
+    };
+    put(&mut t, "c", p.center);
+    put(&mut t, "w", p.w);
+    put(&mut t, "h", p.h);
+    put(&mut t, "dc", p.dest_center);
+    put(&mut t, "dw", p.dest_w);
+    put(&mut t, "dh", p.dest_h);
+    t.insert("mirror".into(), Tag::Int(i32::from(p.mirror)));
+    Tag::Compound(t)
+}
+/// `portal_from_tag` reverses `portal_to_tag`; malformed entries drop out.
+fn portal_from_tag(t: &Tag) -> Option<Portal> {
+    let str_tag = |k: &str| horizon_client::save::text(t.get(k));
+    let int = |k: &str| match t.get(k) {
+        Some(Tag::Int(v)) => Some(*v),
+        _ => None,
+    };
+    let vec = |key: &str| -> Option<Vec3> {
+        let c = |i: usize| match t.get(&format!("{key}{i}")) {
+            Some(Tag::Double(v)) => Some(f64::from_bits(*v)),
+            _ => None,
+        };
+        Some(Vec3::new(c(0)?, c(1)?, c(2)?))
+    };
+    Some(Portal {
+        id: int("id")? as u32,
+        dim: str_tag("dim")?,
+        dest_dim: str_tag("dest")?,
+        center: vec("c")?,
+        w: vec("w")?,
+        h: vec("h")?,
+        dest_center: vec("dc")?,
+        dest_w: vec("dw")?,
+        dest_h: vec("dh")?,
+        mirror: int("mirror")? != 0,
+    })
 }
 
 /// Horizontal unit forward and right for `yaw` (Minecraft's: yaw 0 south).

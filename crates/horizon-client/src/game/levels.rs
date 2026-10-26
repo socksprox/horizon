@@ -114,6 +114,10 @@ impl Levels {
     pub(super) fn parked_world(&self, dim: Dim) -> Option<&World> {
         self.parked.get(&dim).map(|p| &p.world)
     }
+    /// Every parked level's portals (`save_imm_portals` writes them all).
+    pub(super) fn parked_portals(&self) -> impl Iterator<Item = &horizon_client::portals::Portal> {
+        self.parked.values().flat_map(|p| p.imm_portals.iter())
+    }
 }
 
 impl Game<'_> {
@@ -155,7 +159,7 @@ impl Game<'_> {
             dropped: Vec::new(),
             orbs: Vec::new(),
             persist: Default::default(),
-            imm_portals: Vec::new(),
+            imm_portals: self.load_imm_portals(dim),
             lectern_pulses: Vec::new(),
             lid_openers: HashMap::new(),
             lan_events: Vec::new(),

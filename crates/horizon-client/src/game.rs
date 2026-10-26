@@ -9940,6 +9940,7 @@ impl Game<'_> {
         self.save_fight();
         self.save_wandering_trader();
         self.save_portal_arrivals();
+        self.save_imm_portals();
         self.save_stats();
         self.save_advancements();
         self.save_scoreboard();
