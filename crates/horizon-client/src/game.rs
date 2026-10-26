@@ -13290,6 +13290,11 @@ fn start_game<'a>(
     if let Some(d) = options.distance_override {
         settings.render_distance = d;
     }
+    // See-through portals' `/portal` command is a Horizon command: the
+    // feature being on turns the family on (as `--pregen` does).
+    if settings.extras.portals {
+        horizon_client::command::vanilla::set_horizon_commands(true);
+    }
     let mut game = Game::new(res, pack, gui, options, settings, audio, prepared)?;
     game.rest_loader = rest_loader;
     game.ui.vanilla_root = vanilla_root;

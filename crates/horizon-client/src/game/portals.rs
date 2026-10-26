@@ -111,6 +111,8 @@ impl Game<'_> {
     }
     /// A remote client's portals list, wholesale (what the server sent).
     pub(super) fn set_remote_portals(&mut self, list: Vec<Portal>) {
+        // A server that syncs portals speaks Horizon: `/portal` is usable.
+        horizon_client::command::vanilla::set_horizon_commands(true);
         self.imm_portals = list;
         self.portal_sync_dirty = false;
     }
