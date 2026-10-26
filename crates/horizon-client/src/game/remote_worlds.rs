@@ -24,7 +24,6 @@ pub(super) struct RemoteDim {
     /// Its level name (`minecraft:the_nether`), matching `Portal.dest_dim`.
     pub dim: String,
     /// Its dimension type for the chunk decoder (`remote_chunk`).
-    pub dim_type: String,
     pub world: World,
     pub streaming: Streaming,
     /// Entities near the portal exits (`horizon:remote_entities`), drawn
@@ -35,7 +34,7 @@ pub(super) struct RemoteDim {
 impl Game<'_> {
     /// `remote_worlds`' index of `dim`, creating it (empty world, remote
     /// streaming around 0,0 until a portal gives a centre).
-    pub(super) fn ensure_remote_world(&mut self, dim: &str, dim_type: &str) -> usize {
+    pub(super) fn ensure_remote_world(&mut self, dim: &str) -> usize {
         if let Some(i) = self.remote_worlds.iter().position(|w| w.dim == dim) {
             return i;
         }
@@ -48,7 +47,6 @@ impl Game<'_> {
         streaming.radius = REMOTE_RADIUS;
         self.remote_worlds.push(RemoteDim {
             dim: dim.to_owned(),
-            dim_type: dim_type.to_owned(),
             world: World::new(self.res.facts().air, 0),
             streaming,
             entities: Vec::new(),
@@ -62,7 +60,7 @@ impl Game<'_> {
         let Some((dim, dim_type, packet)) = portals::decode_remote_chunk(data) else {
             return;
         };
-        let i = self.ensure_remote_world(&dim, &dim_type);
+        let i = self.ensure_remote_world(&dim);
         // The destination's chunk is the streaming centre (and view radius).
         if let Some(p) = self
             .imm_portals
@@ -95,7 +93,7 @@ impl Game<'_> {
     /// entities: the parked level's mobs plus the guests inside it,
     /// around each portal exit, at five times a second.
     pub(super) fn stream_remote_entities(&mut self) {
-        if self.ticks % 4 != 0 {
+        if !self.ticks.is_multiple_of(4) {
             return;
         }
         let active = self.dim.id().to_owned();
@@ -157,7 +155,7 @@ impl Game<'_> {
         let Some((dim, entities)) = portals::decode_remote_entities(data) else {
             return;
         };
-        let i = self.ensure_remote_world(&dim, &dim);
+        let i = self.ensure_remote_world(&dim);
         self.remote_worlds[i].entities = entities;
     }
 

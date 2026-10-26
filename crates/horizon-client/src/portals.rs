@@ -5,8 +5,9 @@
 //! is the affine map of one quad's basis onto the other's: a point at
 //! `center + u*w + v*h + d*n` maps to `dest_center + u*s_w*dest_w + v*s_h*dest_h
 //! + d*s_n*dest_n`, where `s_w = |dest_w|/|w|` (and `s_n` the in-plane scale).
-//! That single map drives the destination camera for rendering, the traveller's
-//! position and velocity on crossing, and raycasts through the surface.
+//!   That single map drives the destination camera for rendering, the
+//!   traveller's position and velocity on crossing, and raycasts through the
+//!   surface.
 //!
 //! The mod this follows is Immersive Portals (Fabric, MIT): a `Portal` entity
 //! holds `axisW`/`axisH` and a `dest` quad; its teleport and render code apply
@@ -557,6 +558,7 @@ mod tests {
             center: Vec3::new(0.0, 64.0, 0.0),
             w: Vec3::new(2.0, 0.0, 0.0),
             h: Vec3::new(0.0, 2.0, 0.0),
+            auto: false,
             dest_center: Vec3::new(0.0, 64.0, 10.0),
             dest_w: Vec3::new(-2.0, 0.0, 0.0),
             dest_h: Vec3::new(0.0, 2.0, 0.0),
@@ -617,7 +619,7 @@ mod tests {
     #[test]
     fn wire_round_trip() {
         let p = flat_portal();
-        let q = decode(&encode(&[p.clone()])).unwrap();
+        let q = decode(&encode(std::slice::from_ref(&p))).unwrap();
         assert_eq!(q.len(), 1);
         let q = &q[0];
         assert_eq!(q.id, 1);

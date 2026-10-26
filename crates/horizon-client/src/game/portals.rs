@@ -32,17 +32,6 @@ pub(super) const CROSS_HEIGHT: f64 = 0.9;
 const MAX_DISTANCE: f64 = 96.0;
 
 impl Game<'_> {
-    /// Portals of the dimension the level in place is.
-    pub(super) fn dim_portals(&self) -> impl Iterator<Item = &Portal> {
-        let dim = self.dim.id();
-        self.imm_portals.iter().filter(move |p| p.dim == dim)
-    }
-    /// All portals whose far side is `dim` (their views need its world).
-    pub(super) fn portals_into(&self, dim: Dim) -> impl Iterator<Item = &Portal> {
-        let dim = dim.id();
-        self.imm_portals.iter().filter(move |p| p.dest_dim == dim)
-    }
-
     /// `/portal`-family bookkeeping when a portal is added or removed: sync
     /// every guest and the owner, and keep ids unique per level.
     pub(super) fn portals_changed(&mut self) {
@@ -218,7 +207,7 @@ impl Game<'_> {
             .map(|p| p.dest_dim.clone())
             .collect();
         for d in dest_dims {
-            self.ensure_remote_world(&d, &d);
+            self.ensure_remote_world(&d);
         }
         let mut by_distance: Vec<&Portal> = self
             .imm_portals
@@ -421,8 +410,7 @@ impl Game<'_> {
         }) {
             return;
         }
-        let mut id = self.next_portal_id();
-        for flip in [false, true] {
+        for (id, flip) in (self.next_portal_id()..).zip([false, true]) {
             let (w, dw) = if flip {
                 (w.scale(-1.0), w)
             } else {
@@ -444,7 +432,6 @@ impl Game<'_> {
                 mirror: false,
                 auto: true,
             });
-            id += 1;
         }
         self.portals_changed();
     }

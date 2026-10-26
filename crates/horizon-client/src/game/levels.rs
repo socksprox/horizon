@@ -118,17 +118,10 @@ impl Levels {
     pub(super) fn parked_portals(&self) -> impl Iterator<Item = &horizon_client::portals::Portal> {
         self.parked.values().flat_map(|p| p.imm_portals.iter())
     }
-    /// Aim a parked level's streamer at a chunk column — a portal's exit
-    /// streams its surroundings to the other side's viewers.
     /// The parked level's mobs — the remote-entity stream reads them for
     /// portal views into that dimension.
     pub(super) fn parked_mobs(&self, dim: Dim) -> &[Mob] {
         self.parked.get(&dim).map_or(&[], |p| &p.mobs)
-    }
-    pub(super) fn parked_center(&mut self, dim: Dim, center: (i32, i32)) {
-        if let Some(p) = self.parked.get_mut(&dim) {
-            p.streaming.center = center;
-        }
     }
 }
 
@@ -422,7 +415,6 @@ impl Game<'_> {
             .lan
             .as_ref()
             .map_or(&[][..], |h| h.hub.guests.as_slice());
-        let active = self.dim.id();
         let mut dims: Vec<Dim> = [Dim::Overworld, Dim::Nether, Dim::End]
             .into_iter()
             .filter(|d| {

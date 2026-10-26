@@ -1795,13 +1795,10 @@ impl Game<'_> {
             // The march runs only as far as the first portal crossing; a
             // block hit before it wins.
             let stop = first_cross.map_or(reach, |(t, _)| t);
-            match self.clip_ray_until(origin, dir, stop) {
-                Some(hit) => return Some(hit),
-                None => {}
+            if let Some(hit) = self.clip_ray_until(origin, dir, stop) {
+                return Some(hit);
             }
-            let Some((t, p)) = first_cross else {
-                return None;
-            };
+            let (t, p) = first_cross?;
             hops += 1;
             if hops > 4 {
                 return None;
@@ -4535,7 +4532,7 @@ impl Game<'_> {
         self.sync_portals();
         self.stream_remote_worlds();
         self.stream_remote_entities();
-        if self.ticks % 40 == 0 {
+        if self.ticks.is_multiple_of(40) {
             self.prune_lit_portals();
             self.detect_lit_portals();
         }

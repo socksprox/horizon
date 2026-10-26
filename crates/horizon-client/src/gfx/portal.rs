@@ -45,7 +45,6 @@ pub struct View {
 /// `self.portal_targets` slots that survive until a resize; one per `View`.
 pub(super) struct Target {
     pub color: wgpu::Texture,
-    pub depth: wgpu::Texture,
     /// The quad's bind group: main globals + this target's colour.
     pub group: wgpu::BindGroup,
     /// The world-pass bind group: this view's own globals + the shared
@@ -164,7 +163,6 @@ impl Renderer {
             let world_group = self.portal_world_group(&globals);
             self.portal_targets.push(Target {
                 color,
-                depth,
                 group,
                 world_group,
                 globals,
@@ -231,7 +229,7 @@ impl Renderer {
         pages.clear();
         origins.clear();
         let eye = super::projection_center(view.view_proj).filter(|_| self.sides_on);
-        let mut translucent_from = 0usize;
+        let translucent_from;
         {
             let sections = self.sections_for(view.world);
             for (n, v) in visible.iter().enumerate() {

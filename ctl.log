@@ -1,9 +1,9 @@
 load assets: 0.67s
-load facts: 0.96s
-load biomes+env: 0.96s
-load pack tables: 1.37s
-load collision+motion: 1.49s
-load items: 1.75s
+load facts: 0.95s
+load biomes+env: 0.95s
+load pack tables: 1.35s
+load collision+motion: 1.48s
+load items: 1.74s
 Horizon: resources loaded in 1.9s; 35723 block states, 1658 items, 67 biomes; 7 worker threads
 Horizon: no sounds in /Users/tamino/Code/horizon-portals/.local/horizon-client/26.3/assets: they were not copied from your Minecraft install; prepare the game again in the launcher (or run horizon-prepare sounds)
 Horizon: no sound: audio off: HORIZON_NO_AUDIO is set
@@ -12,11 +12,23 @@ Horizon renderer: Apple M1 Pro (Metal, IntegratedGpu)
 Horizon renderer: requesting the device (driver unnamed) with features [MAPPABLE_PRIMARY_BUFFERS | TIMESTAMP_QUERY | INDIRECT_FIRST_INSTANCE] and the adapter's limits (buffers up to 20100448256 bytes, storage bindings up to 20100448256 bytes, 2048 texture layers)
 Horizon renderer: creating the pipelines
 Horizon renderer: pipelines ready (multi-draw on, occlusion culling on, GPU timer on)
-Horizon: live features ready in 65.006583ms
-[05:33:29] [Server thread/INFO]: Player40430[/127.0.0.1:0] logged in with entity id 96 at (-38.5, 70.0, -31.5)
-[05:33:29] [Server thread/INFO]: System chat: Player40430 joined the game
+Horizon: live features ready in 65.636958ms
+[05:56:24] [Server thread/INFO]: Player40430[/127.0.0.1:0] logged in with entity id 88 at (-38.5, 81.0, -25.5)
+[05:56:24] [Server thread/INFO]: System chat: Player40430 joined the game
 Horizon renderer: acquiring the first frame
 Horizon renderer: submitting the first frame
-Horizon: first frame after 1965 ms
-[05:33:55] [Server thread/INFO]: System chat: [Player40430: Teleported Player40430 to -38.500000, 82.000000, -25.500000]
+Horizon: first frame after 1950 ms
+[05:56:52] [Server thread/INFO]: System chat: [Player40430: Teleported Player40430 to -38.500000, 82.000000, -25.500000]
 [chat] Teleported Player40430 to -38.500000, 82.000000, -25.500000
+[05:57:02] [Server thread/INFO]: System chat: [Player40430: #1 minecraft:overworld (-38.5 83.5 -19.0) -> minecraft:the_nether (-4.8 83.5 -2.4)]
+[05:57:02] [Server thread/INFO]: System chat: [Player40430: #2 minecraft:overworld (-38.5 83.5 -20.0) -> minecraft:the_nether (-4.8 83.5 -2.4)]
+[chat] #1 minecraft:overworld (-38.5 83.5 -19.0) -> minecraft:the_nether (-4.8 83.5 -2.4)
+[chat] #2 minecraft:overworld (-38.5 83.5 -20.0) -> minecraft:the_nether (-4.8 83.5 -2.4)
+[05:57:22] [Server thread/INFO]: System chat: [Player40430: Teleported Player40430 to -38.500000, 82.000000, -39.500000]
+[chat] Teleported Player40430 to -38.500000, 82.000000, -39.500000
+[05:57:22] [Server thread/INFO]: System chat: [Player40430: Spawned 2 portal(s).]
+[chat] Spawned 2 portal(s).
+[05:57:23] [Server thread/INFO]: System chat: [Player40430: Teleported Player40430 to -38.500000, 82.000000, -44.500000]
+[chat] Teleported Player40430 to -38.500000, 82.000000, -44.500000
+[05:57:55] [Server thread/INFO]: System chat: [Player40430: Set minecraft:overworld to time marker minecraft:day]
+[chat] Set minecraft:overworld to time marker minecraft:day

@@ -2856,14 +2856,6 @@ impl Renderer {
                 .unwrap_or(&self.portal_empty)
         }
     }
-    /// `self.portal_worlds[at]` (creating it) plus this world's streaming
-    /// bookkeeping — for `game/remote_worlds.rs`.
-    pub fn portal_world(&mut self, at: usize) -> &mut resident::Resident<SectionGpu> {
-        while self.portal_worlds.len() <= at {
-            self.portal_worlds.push(resident::Resident::default());
-        }
-        &mut self.portal_worlds[at]
-    }
     /// `upload` for a remote world (`portal_worlds`): the mesh joins the
     /// shared arena and that world's resident, with no occlusion or
     /// block-entity bookkeeping (`upload_mesh` handles the buffers).
