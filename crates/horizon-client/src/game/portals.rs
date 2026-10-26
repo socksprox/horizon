@@ -353,12 +353,18 @@ impl Game<'_> {
                     },
                     skybox: sky_env && dest_dim == "minecraft:overworld",
                     // Entities for this view, baked against its camera — the
-                    // oblique clip keeps the near side out too.
-                    entities: self.entity_geometry(
-                        glam::DVec3::new(dcam.x, dcam.y, dcam.z),
-                        alpha,
-                        Vec::new(),
-                    ),
+                    // oblique clip keeps the near side out too. A remote
+                    // world adds its streamed entity markers beside them.
+                    entities: {
+                        let cam = glam::DVec3::new(dcam.x, dcam.y, dcam.z);
+                        let mut e = self.entity_geometry(cam, alpha, Vec::new());
+                        if world > 0
+                            && let Some(rw) = self.remote_worlds.get(world - 1)
+                        {
+                            Self::remote_entity_markers(&rw.entities, cam, &mut e);
+                        }
+                        e
+                    },
                     world,
                     parent,
                 },
@@ -574,6 +580,47 @@ impl Game<'_> {
             }
         }
         out
+    }
+
+    /// Remote entities draw as small camera-facing markers — the full
+    /// model sync would need the whole tracked-entity pipeline; the
+    /// position and yaw still show where the far side's entities stand.
+    fn remote_entity_markers(
+        entities: &[portals::RemoteEntity],
+        camera: glam::DVec3,
+        out: &mut Vec<horizon_client::mesher::Vertex>,
+    ) {
+        for e in entities {
+            let p = glam::DVec3::new(e.pos[0], e.pos[1], e.pos[2]);
+            let rel = p - camera;
+            // Billboard: the quad's horizontal axis is the flat normal's
+            // perpendicular; it stands a player-height tall.
+            let (dx, dz) = (camera.x - p.x, camera.z - p.z);
+            let len = (dx * dx + dz * dz).sqrt().max(1e-6);
+            let (rx, rz) = (-dz / len * 0.45, dx / len * 0.45);
+            let (rx, rz) = (rx as f32, rz as f32);
+            let color = if e.kind == 1 {
+                0xFF_40_80_FF_u32 // players read blue
+            } else {
+                0xFF_FF_60_40_u32 // mobs read orange
+            };
+            let corners = [
+                [rel.x as f32 - rx, rel.y as f32, rel.z as f32 - rz],
+                [rel.x as f32 + rx, rel.y as f32, rel.z as f32 + rz],
+                [rel.x as f32 + rx, rel.y as f32 + 1.8, rel.z as f32 + rz],
+                [rel.x as f32 - rx, rel.y as f32 + 1.8, rel.z as f32 - rz],
+            ];
+            for (i, pos) in corners.iter().enumerate() {
+                out.push(horizon_client::mesher::Vertex {
+                    pos: *pos,
+                    uv: [0.0, (i / 2) as f32],
+                    layer: 0,
+                    color,
+                    light: 0xFFFF,
+                    normal: [0, 0, 0, -127],
+                });
+            }
+        }
     }
 
     /// Portals visible through an outer view's own camera — the

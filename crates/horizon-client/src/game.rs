@@ -4534,6 +4534,7 @@ impl Game<'_> {
         self.apply_portal_travel();
         self.sync_portals();
         self.stream_remote_worlds();
+        self.stream_remote_entities();
         if self.ticks % 40 == 0 {
             self.prune_lit_portals();
             self.detect_lit_portals();

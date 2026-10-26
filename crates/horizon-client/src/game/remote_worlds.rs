@@ -27,6 +27,9 @@ pub(super) struct RemoteDim {
     pub dim_type: String,
     pub world: World,
     pub streaming: Streaming,
+    /// Entities near the portal exits (`horizon:remote_entities`), drawn
+    /// as markers inside this dimension's portal views.
+    pub entities: Vec<portals::RemoteEntity>,
 }
 
 impl Game<'_> {
@@ -48,6 +51,7 @@ impl Game<'_> {
             dim_type: dim_type.to_owned(),
             world: World::new(self.res.facts().air, 0),
             streaming,
+            entities: Vec::new(),
         });
         self.remote_worlds.len() - 1
     }
@@ -85,6 +89,76 @@ impl Game<'_> {
             },
             None => log::warn!("Horizon: remote chunk for unknown {dim_type}"),
         }
+    }
+
+    /// `horizon:remote_entities` payloads give remote portal views their
+    /// entities: the parked level's mobs plus the guests inside it,
+    /// around each portal exit, at five times a second.
+    pub(super) fn stream_remote_entities(&mut self) {
+        if self.ticks % 4 != 0 {
+            return;
+        }
+        let active = self.dim.id().to_owned();
+        // Each portal into another dimension wants that side's entities.
+        let want: Vec<(Dim, horizon_core::geometry::Vec3)> = self
+            .imm_portals
+            .iter()
+            .filter(|p| p.dim == active && p.dest_dim != active)
+            .map(|p| (Dim::from_id(&p.dest_dim), p.dest_center))
+            .collect();
+        if want.is_empty() {
+            return;
+        }
+        let Some(host) = self.lan.as_mut() else {
+            return;
+        };
+        let radius = (REMOTE_RADIUS * 16) as f64;
+        for (dim, center) in want {
+            let mut entities = Vec::new();
+            for m in self.levels.parked_mobs(dim) {
+                let d = (m.position.x - center.x)
+                    .abs()
+                    .max((m.position.z - center.z).abs());
+                if d <= radius {
+                    entities.push(portals::RemoteEntity {
+                        pos: [m.position.x, m.position.y, m.position.z],
+                        yaw: m.yaw,
+                        pitch: 0.0,
+                        kind: 0,
+                    });
+                }
+            }
+            for g in &host.hub.guests {
+                if g.placed && g.dimension == dim.id() {
+                    entities.push(portals::RemoteEntity {
+                        pos: g.position,
+                        yaw: g.yaw,
+                        pitch: g.pitch,
+                        kind: 1,
+                    });
+                }
+            }
+            let dim_name = dim.id().to_owned();
+            let data = portals::encode_remote_entities(&dim_name, &entities);
+            for g in &host.hub.guests {
+                if g.placed && g.dimension == active {
+                    g.send(&play::Clientbound::CustomPayload(cfg::CustomPayload {
+                        channel: portals::REMOTE_ENTITIES_CHANNEL.into(),
+                        data: data.clone(),
+                    }));
+                }
+            }
+        }
+    }
+
+    /// A `horizon:remote_entities` payload: the entity markers a remote
+    /// world shows inside its portal views this tick.
+    pub(super) fn remote_world_entities(&mut self, data: &[u8]) {
+        let Some((dim, entities)) = portals::decode_remote_entities(data) else {
+            return;
+        };
+        let i = self.ensure_remote_world(&dim, &dim);
+        self.remote_worlds[i].entities = entities;
     }
 
     /// A `horizon:remote_forget` payload: drop the column and its meshes.

@@ -419,6 +419,50 @@ pub fn decode(data: &[u8]) -> Option<Vec<Portal>> {
     Some(portals)
 }
 
+/// One entity position in a remote dimension, for its portal views
+/// (`horizon:remote_entities`): the streamed side sends them around each
+/// portal exit; the client draws them inside the view.
+#[derive(Clone)]
+pub struct RemoteEntity {
+    pub pos: [f64; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+    /// 0 = mob, 1 = player (the marker tint picks it out).
+    pub kind: u8,
+}
+
+/// `horizon:remote_entities`: dim, then per entity pos/yaw/pitch/kind.
+pub fn encode_remote_entities(dim: &str, entities: &[RemoteEntity]) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_str(&mut out, dim);
+    out.extend_from_slice(&(entities.len() as u16).to_le_bytes());
+    for e in entities {
+        for v in e.pos {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&e.yaw.to_le_bytes());
+        out.extend_from_slice(&e.pitch.to_le_bytes());
+        out.push(e.kind);
+    }
+    out
+}
+/// The decode side of `encode_remote_entities`.
+pub fn decode_remote_entities(data: &[u8]) -> Option<(String, Vec<RemoteEntity>)> {
+    let mut cur = Cursor { data, at: 0 };
+    let dim = cur.str()?.to_owned();
+    let n = u16::from_le_bytes(cur.take(2)?.try_into().ok()?) as usize;
+    let mut entities = Vec::with_capacity(n.min(512));
+    for _ in 0..n {
+        entities.push(RemoteEntity {
+            pos: [cur.f64()?, cur.f64()?, cur.f64()?],
+            yaw: f32::from_le_bytes(cur.take(4)?.try_into().ok()?),
+            pitch: f32::from_le_bytes(cur.take(4)?.try_into().ok()?),
+            kind: cur.u8()?,
+        });
+    }
+    Some((dim, entities))
+}
+
 fn put_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u16).to_le_bytes());
     out.extend_from_slice(s.as_bytes());

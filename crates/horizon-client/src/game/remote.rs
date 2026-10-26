@@ -1656,6 +1656,11 @@ impl Game<'_> {
             C::CustomPayload(p) if p.channel == horizon_client::portals::REMOTE_FORGET_CHANNEL => {
                 self.remote_world_forget(&p.data);
             }
+            C::CustomPayload(p)
+                if p.channel == horizon_client::portals::REMOTE_ENTITIES_CHANNEL =>
+            {
+                self.remote_world_entities(&p.data);
+            }
             C::PlayerPosition(p) => self.remote_teleport(&p)?,
             C::PlayerRotation(p) => {
                 self.yaw = if p.relative_yaw {
