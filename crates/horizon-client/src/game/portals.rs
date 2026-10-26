@@ -6,10 +6,7 @@
 //! servers mutate it and push it to guests, remote clients only read it.
 
 use super::{Dim, Game, commands::R};
-use horizon_client::command::{
-    args::Arg,
-    Context,
-};
+use horizon_client::command::{Context, args::Arg};
 use horizon_client::{
     gfx::{self, portal::View},
     portals::{self, Portal},
@@ -128,15 +125,12 @@ impl Game<'_> {
     /// `data/horizon_imm_portals.dat` in the world folder (like
     /// `nether_portal.rs`'s arrivals file).
     fn imm_portals_path(&self) -> std::path::PathBuf {
-        self.world_root
-            .join("data")
-            .join("horizon_imm_portals.dat")
+        self.world_root.join("data").join("horizon_imm_portals.dat")
     }
     /// A level's portals when it opens (`open_level`): every level keeps
     /// its list in the one file, tagged by dimension.
     pub(super) fn load_imm_portals(&self, dim: Dim) -> Vec<Portal> {
-        let Some(root) = horizon_client::save::read_dat(&self.imm_portals_path())
-        else {
+        let Some(root) = horizon_client::save::read_dat(&self.imm_portals_path()) else {
             return Vec::new();
         };
         let Some(Tag::List(list)) = root.get("portals") else {
@@ -158,8 +152,7 @@ impl Game<'_> {
             list.push(portal_to_tag(p));
         }
         let root = Tag::compound([("portals", Tag::List(list))]);
-        if let Err(e) = horizon_client::save::write_dat(&self.imm_portals_path(), root)
-        {
+        if let Err(e) = horizon_client::save::write_dat(&self.imm_portals_path(), root) {
             log::warn!("Horizon: saving portals failed: {e}");
         }
     }
@@ -204,7 +197,12 @@ impl Game<'_> {
         alpha: f64,
     ) -> Vec<View> {
         let main_vp = horizon_client::gfx::world_view_projection(
-            aspect, fov_degrees, yaw, pitch, bob, depth_far,
+            aspect,
+            fov_degrees,
+            yaw,
+            pitch,
+            bob,
+            depth_far,
         );
         let dim = self.dim.id();
         // Remote worlds exist before the borrow: a cross-dimension view's
@@ -237,9 +235,7 @@ impl Game<'_> {
             let cx = (min.x + max.x) / 2.0;
             let cy = (min.y + max.y) / 2.0;
             let cz = (min.z + max.z) / 2.0;
-            camera
-                .distance_squared(Vec3::new(cx, cy, cz))
-                .to_bits()
+            camera.distance_squared(Vec3::new(cx, cy, cz)).to_bits()
         });
         // View specs first: `by_distance` borrows `imm_portals`, and the
         // entity bake below needs `&mut self`.
@@ -276,11 +272,7 @@ impl Game<'_> {
                     0.5,
                 )
                 .subtract(dcam);
-            let rn = view.transform_vector3(glam::Vec3::new(
-                n.x as f32,
-                n.y as f32,
-                n.z as f32,
-            ));
+            let rn = view.transform_vector3(glam::Vec3::new(n.x as f32, n.y as f32, n.z as f32));
             let d = -(n.x * cam_rel.x + n.y * cam_rel.y + n.z * cam_rel.z) as f32;
             let clip = glam::Vec4::new(rn.x, rn.y, rn.z, d);
             // The clip plane folds into the bare projection; bob and the
@@ -348,6 +340,10 @@ impl Game<'_> {
             origin[2] as f64 + axis.z * (width - 1) as f64 * 0.5 + 0.5 * (1.0 - axis.z),
         );
         let (w, h) = (axis.scale(width as f64), Vec3::new(0.0, height as f64, 0.0));
+        // The thin axis holds the two surface faces; each record's quad
+        // sits just outside its own face so the nether_portal swirl (drawn
+        // on the block surface) never covers the see-through quad.
+        let thin = Vec3::new(1.0 - axis.x, 0.0, 1.0 - axis.z);
         let dest_center = Vec3::new(center.x * scale, center.y, center.z * scale);
         // An exit that already existed (or was lit before) is not added
         // twice.
@@ -366,12 +362,19 @@ impl Game<'_> {
         }
         let mut id = self.next_portal_id();
         for flip in [false, true] {
-            let (w, dw) = if flip { (w.scale(-1.0), w) } else { (w, w.scale(-1.0)) };
+            let (w, dw) = if flip {
+                (w.scale(-1.0), w)
+            } else {
+                (w, w.scale(-1.0))
+            };
+            // The +thin face belongs to the +z-normal record, and -thin to
+            // the -z one: half a block plus a hair past the block surface.
+            let face = thin.scale(if flip { -0.51 } else { 0.51 });
             self.imm_portals.push(Portal {
                 id,
                 dim: dim.to_owned(),
                 dest_dim: dest_dim.to_owned(),
-                center,
+                center: center.add_vector(face),
                 w,
                 h,
                 dest_center,
@@ -383,6 +386,55 @@ impl Game<'_> {
             id += 1;
         }
         self.portals_changed();
+    }
+
+    /// Lit frames exist wherever a `nether_portal` block is — lit by
+    /// flint, by fire's own on-place, by a travel-made exit or by a
+    /// command — so once in a while the blocks around each player in this
+    /// level are scanned for one that forms a frame (portal_shape), and
+    /// `lit_nether_portal` dedupes. Runs only while see-through portals
+    /// are on.
+    pub(super) fn detect_lit_portals(&mut self) {
+        if !self.settings.extras.portals {
+            return;
+        }
+        let dim = self.dim.id();
+        let mut centers: Vec<[i32; 3]> = Vec::new();
+        if let Some(host) = self.lan.as_ref() {
+            for g in &host.hub.guests {
+                if g.placed && g.dimension == dim {
+                    centers.push(g.position.map(|v| v.floor() as i32));
+                }
+            }
+        }
+        if let Some(p) = &self.player {
+            let pos = p.position;
+            centers.push([
+                pos.x.floor() as i32,
+                pos.y.floor() as i32,
+                pos.z.floor() as i32,
+            ]);
+        }
+        for c in centers {
+            for y in (c[1] - 24).max(-64)..=(c[1] + 24).min(319) {
+                for z in c[2] - 24..=c[2] + 24 {
+                    for x in c[0] - 24..=c[0] + 24 {
+                        let state = self.world.block(x, y, z);
+                        if *self.res.facts().get(state).name != *"minecraft:nether_portal" {
+                            continue;
+                        }
+                        for x_axis in [true, false] {
+                            if let Some((origin, width, height)) =
+                                self.portal_shape([x, y, z], x_axis)
+                            {
+                                self.lit_nether_portal(origin, width, height, x_axis);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Lit frames die with their portal blocks: re-check each `auto`
@@ -492,13 +544,7 @@ impl Game<'_> {
                 let feet = player.position;
                 let yaw = self.yaw;
                 let dim = self.dim.id().to_owned();
-                let mut next = self
-                    .imm_portals
-                    .iter()
-                    .map(|p| p.id)
-                    .max()
-                    .unwrap_or(0)
-                    + 1;
+                let mut next = self.imm_portals.iter().map(|p| p.id).max().unwrap_or(0) + 1;
                 let spawned = match id {
                     "portal.spawn" => {
                         if let Some(Arg::Resource(dest)) = ctx.get("dimension") {
@@ -558,7 +604,10 @@ fn portal_to_tag(p: &Portal) -> Tag {
     t.insert("dest".into(), Tag::String(p.dest_dim.as_str().into()));
     let put = |t: &mut Compound, key: &str, v: Vec3| {
         for (k, c) in v.components().iter().enumerate() {
-            t.insert(format!("{key}{k}").as_str().into(), Tag::Double(c.to_bits()));
+            t.insert(
+                format!("{key}{k}").as_str().into(),
+                Tag::Double(c.to_bits()),
+            );
         }
     };
     put(&mut t, "c", p.center);

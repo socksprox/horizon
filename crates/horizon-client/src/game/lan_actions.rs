@@ -5,7 +5,9 @@
 //! blocks, attacking and the commands all behave exactly as they do for the
 //! host, and every world change they cause reaches all players through the
 //! block log, the level events and the entity tracker.
-use super::{Dim, Game, GuestUse, Hit, Mining, Screen, lan::LanHost, respawn_anchor::RespawnConfig};
+use super::{
+    Dim, Game, GuestUse, Hit, Mining, Screen, lan::LanHost, respawn_anchor::RespawnConfig,
+};
 use horizon_client::{
     command::vanilla,
     containers::BlockEntity,
@@ -1780,9 +1782,7 @@ impl Game<'_> {
                 g.position[1] + super::portals::CROSS_HEIGHT,
                 g.position[2],
             );
-            let Some(p) =
-                Game::crossed_in(&self.imm_portals, &dim_owned, from, to).cloned()
-            else {
+            let Some(p) = Game::crossed_in(&self.imm_portals, &dim_owned, from, to).cloned() else {
                 continue;
             };
             if p.dest_dim == dim_owned {
@@ -1791,12 +1791,13 @@ impl Game<'_> {
             let feet = Vec3::new(g.position[0], g.position[1], g.position[2]);
             let at = p.transform_point(feet);
             let (yaw, pitch) = p.transform_yaw_pitch(g.yaw, g.pitch);
-            self.level_teleports.push(super::server_travel::LevelTeleport {
-                conn: g.conn,
-                dim: Dim::from_id(&p.dest_dim),
-                at: [at.x, at.y, at.z],
-                rotation: Some([yaw, pitch]),
-            });
+            self.level_teleports
+                .push(super::server_travel::LevelTeleport {
+                    conn: g.conn,
+                    dim: Dim::from_id(&p.dest_dim),
+                    at: [at.x, at.y, at.z],
+                    rotation: Some([yaw, pitch]),
+                });
         }
         let conns: Vec<u32> = host
             .hub

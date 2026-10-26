@@ -133,8 +133,8 @@ mod remote_mob_use;
 mod remote_objects;
 mod remote_projectiles;
 mod remote_stations;
-mod remote_worlds;
 mod remote_vehicles;
+mod remote_worlds;
 mod render_control;
 mod render_tick;
 mod respawn_anchor;
@@ -4242,16 +4242,14 @@ impl Game<'_> {
             if self.portal_cooldown > 0 {
                 self.portal_cooldown -= 1;
             } else {
-                let from = self
-                    .previous_position
-                    .add_vector(Vec3::new(0.0, portals::CROSS_HEIGHT, 0.0));
+                let from =
+                    self.previous_position
+                        .add_vector(Vec3::new(0.0, portals::CROSS_HEIGHT, 0.0));
                 let to = player
                     .position
                     .add_vector(Vec3::new(0.0, portals::CROSS_HEIGHT, 0.0));
                 let dim = self.dim.id();
-                if let Some(p) =
-                    Self::crossed_in(&self.imm_portals, dim, from, to).cloned()
-                {
+                if let Some(p) = Self::crossed_in(&self.imm_portals, dim, from, to).cloned() {
                     if p.dest_dim == dim {
                         player.position = p.transform_point(player.position);
                         player.velocity = p.transform_dir(player.velocity);
@@ -4471,6 +4469,7 @@ impl Game<'_> {
         self.stream_remote_worlds();
         if self.ticks % 40 == 0 {
             self.prune_lit_portals();
+            self.detect_lit_portals();
         }
         self.update_chunk_tickets();
         horizon_client::spans::time("tick_effects", || self.tick_effects(running));

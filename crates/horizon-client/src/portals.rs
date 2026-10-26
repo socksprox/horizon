@@ -25,11 +25,7 @@ pub const WIRE_VERSION: u8 = 1;
 /// A remote dimension's chunk column on the wire (`horizon:remote_chunk`):
 /// version byte, the level and dimension-type names, then the
 /// LevelChunkWithLight body — the same bytes a vanilla server sends.
-pub fn encode_remote_chunk(
-    dim: &str,
-    dim_type: &str,
-    packet: &LevelChunkWithLight,
-) -> Vec<u8> {
+pub fn encode_remote_chunk(dim: &str, dim_type: &str, packet: &LevelChunkWithLight) -> Vec<u8> {
     let mut out = vec![WIRE_VERSION];
     put_str(&mut out, dim);
     put_str(&mut out, dim_type);
@@ -159,7 +155,10 @@ impl Portal {
     /// plane); only each other may be non-orthogonal, which the dot
     /// coordinates still read correctly for a rectangle.
     fn in_plane_scale(&self) -> (f64, f64) {
-        let (sw, sh) = (self.dest_w.length() / self.w.length(), self.dest_h.length() / self.h.length());
+        let (sw, sh) = (
+            self.dest_w.length() / self.w.length(),
+            self.dest_h.length() / self.h.length(),
+        );
         (sw, sh)
     }
     /// The `n`-direction scale: the in-plane scale, so a 2x portal scales
@@ -175,8 +174,12 @@ impl Portal {
     /// the front and leaves the front. `mirror` additionally reflects the
     /// horizontal axis.
     pub fn transform_point(&self, p: Vec3) -> Vec3 {
-        let Some((w, h, n)) = self.basis() else { return p };
-        let Some((dw, dh, dn)) = self.dest_basis() else { return p };
+        let Some((w, h, n)) = self.basis() else {
+            return p;
+        };
+        let Some((dw, dh, dn)) = self.dest_basis() else {
+            return p;
+        };
         let s = p.subtract(self.center);
         let (sw, sh) = self.in_plane_scale();
         let sn = self.normal_scale();
@@ -190,8 +193,12 @@ impl Portal {
     }
     /// A direction or velocity mapped through the portal (no translation).
     pub fn transform_dir(&self, dir: Vec3) -> Vec3 {
-        let Some((w, h, n)) = self.basis() else { return dir };
-        let Some((dw, dh, dn)) = self.dest_basis() else { return dir };
+        let Some((w, h, n)) = self.basis() else {
+            return dir;
+        };
+        let Some((dw, dh, dn)) = self.dest_basis() else {
+            return dir;
+        };
         let (sw, sh) = self.in_plane_scale();
         let sn = self.normal_scale();
         let u = dir.dot(w) * sw * if self.mirror { -1.0 } else { 1.0 };
@@ -349,9 +356,7 @@ pub fn encode(portals: &[Portal]) -> Vec<u8> {
         put_str(&mut out, &p.id.to_string());
         put_str(&mut out, &p.dim);
         put_str(&mut out, &p.dest_dim);
-        for v in [
-            p.center, p.w, p.h, p.dest_center, p.dest_w, p.dest_h,
-        ] {
+        for v in [p.center, p.w, p.h, p.dest_center, p.dest_w, p.dest_h] {
             for c in v.components() {
                 out.extend_from_slice(&c.to_le_bytes());
             }
@@ -433,11 +438,7 @@ impl<'a> Cursor<'a> {
 /// (you walk in one face and out of the other's far face): `b` is `a`'s
 /// destination and `a` is `b`'s. `half_d` pushes each centre this far along
 /// its normal so the traveller lands clear of the plane they exit.
-pub fn pair(
-    mut a: Portal,
-    mut b: Portal,
-    next_id: &mut u32,
-) -> (Portal, Portal) {
+pub fn pair(mut a: Portal, mut b: Portal, next_id: &mut u32) -> (Portal, Portal) {
     a.id = *next_id;
     *next_id += 1;
     b.id = *next_id;
@@ -525,35 +526,15 @@ mod tests {
     fn crossing_is_one_way_within_bounds() {
         let p = flat_portal();
         // Entering front (+z) to back crosses.
-        assert!(p.crossed(
-            Vec3::new(0.5, 64.0, 0.5),
-            Vec3::new(0.5, 64.0, -0.5),
-            0.0
-        ));
+        assert!(p.crossed(Vec3::new(0.5, 64.0, 0.5), Vec3::new(0.5, 64.0, -0.5), 0.0));
         // Back to front is not "entering" (you arrive on the far side).
-        assert!(!p.crossed(
-            Vec3::new(0.5, 64.0, -0.5),
-            Vec3::new(0.5, 64.0, 0.5),
-            0.0
-        ));
+        assert!(!p.crossed(Vec3::new(0.5, 64.0, -0.5), Vec3::new(0.5, 64.0, 0.5), 0.0));
         // Outside the quad's x bounds.
-        assert!(!p.crossed(
-            Vec3::new(5.0, 64.0, 0.5),
-            Vec3::new(5.0, 64.0, -0.5),
-            0.0
-        ));
+        assert!(!p.crossed(Vec3::new(5.0, 64.0, 0.5), Vec3::new(5.0, 64.0, -0.5), 0.0));
         // Outside its y bounds.
-        assert!(!p.crossed(
-            Vec3::new(0.0, 70.0, 0.5),
-            Vec3::new(0.0, 70.0, -0.5),
-            0.0
-        ));
+        assert!(!p.crossed(Vec3::new(0.0, 70.0, 0.5), Vec3::new(0.0, 70.0, -0.5), 0.0));
         // Margin widens the accepted rectangle.
-        assert!(p.crossed(
-            Vec3::new(1.5, 64.0, 0.5),
-            Vec3::new(1.5, 64.0, -0.5),
-            0.6
-        ));
+        assert!(p.crossed(Vec3::new(1.5, 64.0, 0.5), Vec3::new(1.5, 64.0, -0.5), 0.6));
     }
 
     #[test]

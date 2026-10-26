@@ -211,25 +211,11 @@ impl Renderer {
         let mut globals = *base;
         globals.view_proj = view.view_proj.to_cols_array_2d();
         if let Some(sky) = &view.sky {
-            globals.fog_color = [
-                sky.fog_color[0],
-                sky.fog_color[1],
-                sky.fog_color[2],
-                1.0,
-            ];
-            globals.sky_color = [
-                sky.sky_color[0],
-                sky.sky_color[1],
-                sky.sky_color[2],
-                1.0,
-            ];
+            globals.fog_color = [sky.fog_color[0], sky.fog_color[1], sky.fog_color[2], 1.0];
+            globals.sky_color = [sky.sky_color[0], sky.sky_color[1], sky.sky_color[2], 1.0];
         }
-        self.uploads.buffer(
-            encoder,
-            &target.globals,
-            0,
-            bytemuck::bytes_of(&globals),
-        );
+        self.uploads
+            .buffer(encoder, &target.globals, 0, bytemuck::bytes_of(&globals));
         // Section draws for this view: solids' facing runs first, every
         // translucent after them so it composites over the solids.
         let mut draws = std::mem::take(&mut self.portal_draws);
@@ -367,12 +353,7 @@ impl Renderer {
     /// Draw entries into a pass without the indirect buffer: the same
     /// `(page, index_page)` run grouping as `draw_sections`, one
     /// `draw_indexed` per entry (portal views are few and small).
-    fn draw_direct(
-        &self,
-        pass: &mut wgpu::RenderPass<'_>,
-        first: usize,
-        end: usize,
-    ) {
+    fn draw_direct(&self, pass: &mut wgpu::RenderPass<'_>, first: usize, end: usize) {
         let (draws, pages) = (&self.portal_draws[..], &self.portal_pages[..]);
         let (mut i, end) = (first, end.min(draws.len()));
         while i < end {

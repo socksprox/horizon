@@ -9,12 +9,7 @@
 //! `Renderer.portal_worlds[i]`, which `portal::View::world` names.
 
 use super::{Dim, Game, remote::NoTerrain};
-use horizon_client::{
-    chunk::SECTIONS,
-    portals,
-    streaming::Streaming,
-    world::World,
-};
+use horizon_client::{chunk::SECTIONS, portals, streaming::Streaming, world::World};
 use horizon_protocol::packets::{configuration as cfg, play};
 use std::{collections::HashSet, sync::Arc};
 
@@ -156,8 +151,7 @@ impl Game<'_> {
         if let Some(log) = &self.world.block_log
             && !log.is_empty()
         {
-            let touched: HashSet<(i32, i32)> =
-                log.iter().map(|p| (p.0 >> 4, p.2 >> 4)).collect();
+            let touched: HashSet<(i32, i32)> = log.iter().map(|p| (p.0 >> 4, p.2 >> 4)).collect();
             let dim = active.to_owned();
             for sent in self.remote_sent.values_mut() {
                 sent.retain(|(d, x, z)| *d != dim || !touched.contains(&(*x, *z)));
@@ -203,7 +197,9 @@ impl Game<'_> {
             };
             // Guests in another level get this level's blocks live.
             let d = horizon_protocol::registry::DimensionType::vanilla(dim.id());
-            host.hub.encoder.set_dimension(d.min_y, d.height, d.has_skylight);
+            host.hub
+                .encoder
+                .set_dimension(d.min_y, d.height, d.has_skylight);
             let dim_name = dim.id().to_owned();
             for g in &host.hub.guests {
                 if sent == 0 {
@@ -225,10 +221,8 @@ impl Game<'_> {
                     let Some(chunk) = world.chunks.get(&(x, z)) else {
                         continue;
                     };
-                    let packet =
-                        host.hub.encoder.encode(chunk, &world.block_entities);
-                    let data =
-                        portals::encode_remote_chunk(&dim_name, &dim_name, &packet);
+                    let packet = host.hub.encoder.encode(chunk, &world.block_entities);
+                    let data = portals::encode_remote_chunk(&dim_name, &dim_name, &packet);
                     g.send(&play::Clientbound::CustomPayload(cfg::CustomPayload {
                         channel: portals::REMOTE_CHUNK_CHANNEL.into(),
                         data,
@@ -238,7 +232,9 @@ impl Game<'_> {
                 }
             }
             let a = horizon_protocol::registry::DimensionType::vanilla(active);
-            host.hub.encoder.set_dimension(a.min_y, a.height, a.has_skylight);
+            host.hub
+                .encoder
+                .set_dimension(a.min_y, a.height, a.has_skylight);
         }
     }
 }

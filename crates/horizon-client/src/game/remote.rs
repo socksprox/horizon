@@ -1645,21 +1645,15 @@ impl Game<'_> {
             }
             // Horizon channels (`horizon_client::portals`): the level's
             // see-through portals, pushed by the server.
-            C::CustomPayload(p)
-                if p.channel == horizon_client::portals::CHANNEL =>
-            {
+            C::CustomPayload(p) if p.channel == horizon_client::portals::CHANNEL => {
                 if let Some(list) = horizon_client::portals::decode(&p.data) {
                     self.set_remote_portals(list);
                 }
             }
-            C::CustomPayload(p)
-                if p.channel == horizon_client::portals::REMOTE_CHUNK_CHANNEL =>
-            {
+            C::CustomPayload(p) if p.channel == horizon_client::portals::REMOTE_CHUNK_CHANNEL => {
                 self.remote_world_chunk(&p.data);
             }
-            C::CustomPayload(p)
-                if p.channel == horizon_client::portals::REMOTE_FORGET_CHANNEL =>
-            {
+            C::CustomPayload(p) if p.channel == horizon_client::portals::REMOTE_FORGET_CHANNEL => {
                 self.remote_world_forget(&p.data);
             }
             C::PlayerPosition(p) => self.remote_teleport(&p)?,
@@ -3212,16 +3206,17 @@ impl Game<'_> {
             if self.portal_cooldown > 0 {
                 self.portal_cooldown -= 1;
             } else {
-                let from = self
-                    .previous_position
-                    .add_vector(Vec3::new(0.0, super::portals::CROSS_HEIGHT, 0.0));
-                let to = player
-                    .position
-                    .add_vector(Vec3::new(0.0, super::portals::CROSS_HEIGHT, 0.0));
+                let from = self.previous_position.add_vector(Vec3::new(
+                    0.0,
+                    super::portals::CROSS_HEIGHT,
+                    0.0,
+                ));
+                let to =
+                    player
+                        .position
+                        .add_vector(Vec3::new(0.0, super::portals::CROSS_HEIGHT, 0.0));
                 let dim = self.dim.id();
-                if let Some(p) =
-                    Self::crossed_in(&self.imm_portals, dim, from, to).cloned()
-                {
+                if let Some(p) = Self::crossed_in(&self.imm_portals, dim, from, to).cloned() {
                     if p.dest_dim == dim {
                         player.position = p.transform_point(player.position);
                         player.velocity = p.transform_dir(player.velocity);
