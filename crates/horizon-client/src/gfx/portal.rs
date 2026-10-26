@@ -18,7 +18,7 @@ use glam::{DVec3, Mat4, Vec4};
 pub const MAX_VIEWS: usize = 4;
 
 /// One portal the frame wants drawn, the far side rendered as `view`.
-pub struct View<'a> {
+pub struct View {
     /// The quad's corners relative to the main camera (the drawn surface).
     pub corners: [[f32; 3]; 4],
     /// Where the destination camera sits in the destination world.
@@ -31,7 +31,7 @@ pub struct View<'a> {
     /// Whether the destination's sky shows at all (`frame.skybox` for it).
     pub skybox: bool,
     /// Entities baked for this view, camera-relative to `camera`.
-    pub entities: &'a [super::Vertex],
+    pub entities: Vec<crate::mesher::Vertex>,
     /// Which resident world to draw: the current one (0), or a remote
     /// world the client also holds (`remote` index + 1).
     pub world: usize,
@@ -300,7 +300,7 @@ impl Renderer {
                 self.portal_entities = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("Portal entity vertices"),
                     size: self.portal_entity_capacity
-                        * std::mem::size_of::<super::Vertex>() as u64
+                        * std::mem::size_of::<crate::mesher::Vertex>() as u64
                         * 4,
                     usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
@@ -310,7 +310,7 @@ impl Renderer {
                 encoder,
                 &self.portal_entities,
                 0,
-                bytemuck::cast_slice(view.entities),
+                bytemuck::cast_slice(&view.entities),
             );
         }
         let fog = globals.fog_color;

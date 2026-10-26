@@ -237,7 +237,7 @@ pub struct Frame<'a> {
     /// See-through portals (`gfx/portal.rs`): each entry's world renders
     /// into its offscreen target before the world pass, and the quad
     /// samples it where it lands on screen. Empty on every vanilla frame.
-    pub portal_views: &'a [portal::View<'a>],
+    pub portal_views: &'a [portal::View],
     pub weather_time: crate::weather::Time,
     /// Horizon Extras' dynamic lights, nearest first (`dynamic_light::select`); empty when off.
     pub dynamic_lights: &'a [[f32; 4]],

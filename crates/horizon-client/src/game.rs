@@ -10270,6 +10270,7 @@ impl Game<'_> {
                 bob,
                 depth_far,
                 self.renderer.as_ref().map_or(16.0 / 9.0, |r| r.aspect()),
+                alpha,
             )
         } else {
             Vec::new()

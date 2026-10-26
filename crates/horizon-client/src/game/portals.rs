@@ -199,7 +199,8 @@ impl Game<'_> {
         bob: glam::Mat4,
         depth_far: f32,
         aspect: f32,
-    ) -> Vec<View<'static>> {
+        alpha: f64,
+    ) -> Vec<View> {
         let main_vp = horizon_client::gfx::world_view_projection(
             aspect, fov_degrees, yaw, pitch, bob, depth_far,
         );
@@ -238,9 +239,11 @@ impl Game<'_> {
                 .distance_squared(Vec3::new(cx, cy, cz))
                 .to_bits()
         });
-        let mut views = Vec::new();
+        // View specs first: `by_distance` borrows `imm_portals`, and the
+        // entity bake below needs `&mut self`.
+        let mut specs = Vec::new();
         for p in by_distance {
-            if views.len() >= gfx::portal::MAX_VIEWS {
+            if specs.len() >= gfx::portal::MAX_VIEWS {
                 break;
             }
             let Some(quad) = p.quad() else { continue };
@@ -291,17 +294,27 @@ impl Game<'_> {
                 // far side: draw nothing rather than the wrong world.
                 continue;
             }
-            views.push(View {
+            specs.push((corners, dcam, view_proj, world));
+        }
+        let skybox = self.dim == Dim::Overworld && self.settings.horizon.sky;
+        specs
+            .into_iter()
+            .map(|(corners, dcam, view_proj, world)| View {
                 corners,
                 camera: glam::DVec3::new(dcam.x, dcam.y, dcam.z),
                 view_proj,
                 sky: None,
-                skybox: self.dim == Dim::Overworld && self.settings.horizon.sky,
-                entities: &[],
+                skybox,
+                // Entities for this view, baked against its camera — the
+                // oblique clip keeps the near side out too.
+                entities: self.entity_geometry(
+                    glam::DVec3::new(dcam.x, dcam.y, dcam.z),
+                    alpha,
+                    Vec::new(),
+                ),
                 world,
-            });
-        }
-        views
+            })
+            .collect()
     }
 
     /// Which resident world a `View::world` draws: the current one (0), or
