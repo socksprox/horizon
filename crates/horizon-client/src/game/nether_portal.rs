@@ -374,6 +374,22 @@ impl Game<'_> {
             return Ok(());
         };
         let exit = self.nether_exit_portal(&plan);
+        if let Some(exit) = exit {
+            // The far frame turns see-through too (`lit_nether_portal`
+            // dedupes when it already knew).
+            let corner = exit.min_corner;
+            let x_axis = self
+                .res
+                .behaviours()
+                .portal_axis(self.world.block(corner.x, corner.y, corner.z))
+                .unwrap_or(true);
+            self.lit_nether_portal(
+                [corner.x, corner.y, corner.z],
+                exit.axis1_size,
+                exit.axis2_size,
+                x_axis,
+            );
+        }
         let (position, rotation) = match exit {
             Some(exit) => self.arrival(&plan, exit),
             None => (target, 0.0),

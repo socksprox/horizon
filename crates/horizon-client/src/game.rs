@@ -4469,6 +4469,9 @@ impl Game<'_> {
         self.apply_portal_travel();
         self.sync_portals();
         self.stream_remote_worlds();
+        if self.ticks % 40 == 0 {
+            self.prune_lit_portals();
+        }
         self.update_chunk_tickets();
         horizon_client::spans::time("tick_effects", || self.tick_effects(running));
         // Player.tick's ItemCooldowns.tick for the window's player (a
@@ -8032,6 +8035,7 @@ impl Game<'_> {
                         )?;
                     }
                 }
+                self.lit_nether_portal(origin, width, height, x_axis);
                 return Ok(true);
             }
         }

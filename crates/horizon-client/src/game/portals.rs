@@ -177,7 +177,9 @@ impl Game<'_> {
     ) -> Option<&'p Portal> {
         portals
             .iter()
-            .find(|p| p.dim == dim && p.crossed(from, to, CROSS_MARGIN))
+            // Lit frames render see-through but vanilla's stand-in timer
+            // still owns the trip through them.
+            .find(|p| !p.auto && p.dim == dim && p.crossed(from, to, CROSS_MARGIN))
     }
     /// A cross-dimension crossing queued inside the player borrow is run
     /// once it is out (`apply_portal_travel` early in the tick).
@@ -315,6 +317,104 @@ impl Game<'_> {
                 world,
             })
             .collect()
+    }
+
+    /// A just-lit frame joins the portal list twice — once per face — so
+    /// it is see-through from either side (`try_light_portal`). `auto`
+    /// keeps vanilla's own stand-in timer in charge of the trip; the
+    /// far side sits at the vanilla-scaled coordinates until a real exit
+    /// is known.
+    pub(super) fn lit_nether_portal(
+        &mut self,
+        origin: [i32; 3],
+        width: i32,
+        height: i32,
+        x_axis: bool,
+    ) {
+        let (dim, dest_dim, scale) = match self.dim {
+            Dim::Nether => ("minecraft:the_nether", "minecraft:overworld", 8.0),
+            _ => ("minecraft:overworld", "minecraft:the_nether", 1.0 / 8.0),
+        };
+        let axis = if x_axis {
+            Vec3::new(1.0, 0.0, 0.0)
+        } else {
+            Vec3::new(0.0, 0.0, 1.0)
+        };
+        // The surface plane passes through the filled blocks' centres;
+        // w and h are full extents (`Portal::quad` halves them).
+        let center = Vec3::new(
+            origin[0] as f64 + axis.x * (width - 1) as f64 * 0.5 + 0.5 * (1.0 - axis.x),
+            origin[1] as f64 + (height - 1) as f64 * 0.5 + 0.5,
+            origin[2] as f64 + axis.z * (width - 1) as f64 * 0.5 + 0.5 * (1.0 - axis.z),
+        );
+        let (w, h) = (axis.scale(width as f64), Vec3::new(0.0, height as f64, 0.0));
+        let dest_center = Vec3::new(center.x * scale, center.y, center.z * scale);
+        // An exit that already existed (or was lit before) is not added
+        // twice.
+        if self.imm_portals.iter().any(|p| {
+            p.auto && {
+                let (min, max) = p.bounds();
+                let c = Vec3::new(
+                    (min.x + max.x) / 2.0,
+                    (min.y + max.y) / 2.0,
+                    (min.z + max.z) / 2.0,
+                );
+                c.distance(center) < 1.0
+            }
+        }) {
+            return;
+        }
+        let mut id = self.next_portal_id();
+        for flip in [false, true] {
+            let (w, dw) = if flip { (w.scale(-1.0), w) } else { (w, w.scale(-1.0)) };
+            self.imm_portals.push(Portal {
+                id,
+                dim: dim.to_owned(),
+                dest_dim: dest_dim.to_owned(),
+                center,
+                w,
+                h,
+                dest_center,
+                dest_w: dw,
+                dest_h: h,
+                mirror: false,
+                auto: true,
+            });
+            id += 1;
+        }
+        self.portals_changed();
+    }
+
+    /// Lit frames die with their portal blocks: re-check each `auto`
+    /// portal's centre block now and then (`tick_world`) — a broken frame
+    /// drops its pair (they share the lost centre).
+    pub(super) fn prune_lit_portals(&mut self) {
+        if self.imm_portals.iter().all(|p| !p.auto) {
+            return;
+        }
+        let before = self.imm_portals.len();
+        let mut list = std::mem::take(&mut self.imm_portals);
+        list.retain(|p| {
+            !p.auto || {
+                let (min, max) = p.bounds();
+                let (x, y, z) = (
+                    ((min.x + max.x) / 2.0).floor() as i32,
+                    ((min.y + max.y) / 2.0).floor() as i32,
+                    ((min.z + max.z) / 2.0).floor() as i32,
+                );
+                let state = self.world.block(x, y, z);
+                self.res.facts().get(state).name.as_ref() == "minecraft:nether_portal"
+            }
+        });
+        self.imm_portals = list;
+        if self.imm_portals.len() != before {
+            self.portals_changed();
+        }
+    }
+
+    /// The next portal id for this level (ids are per-level, small).
+    fn next_portal_id(&self) -> u32 {
+        self.imm_portals.iter().map(|p| p.id).max().unwrap_or(0) + 1
     }
 
     /// Which resident world a `View::world` draws: the current one (0), or
@@ -468,6 +568,7 @@ fn portal_to_tag(p: &Portal) -> Tag {
     put(&mut t, "dw", p.dest_w);
     put(&mut t, "dh", p.dest_h);
     t.insert("mirror".into(), Tag::Int(i32::from(p.mirror)));
+    t.insert("auto".into(), Tag::Int(i32::from(p.auto)));
     Tag::Compound(t)
 }
 /// `portal_from_tag` reverses `portal_to_tag`; malformed entries drop out.
@@ -495,6 +596,7 @@ fn portal_from_tag(t: &Tag) -> Option<Portal> {
         dest_w: vec("dw")?,
         dest_h: vec("dh")?,
         mirror: int("mirror")? != 0,
+        auto: int("auto")? != 0,
     })
 }
 
@@ -522,6 +624,7 @@ fn portal_pair(feet: Vec3, yaw: f32, dim: &str, next: &mut u32) -> (Portal, Port
         dest_w: Vec3::ZERO,
         dest_h: Vec3::ZERO,
         mirror: false,
+        auto: false,
     };
     let b = Portal {
         center: a.center.add_vector(fwd.scale(16.0)),
@@ -547,6 +650,7 @@ fn portal_to(feet: Vec3, yaw: f32, dim: &str, dest: &str, id: u32) -> Portal {
         dest_w: right.scale(2.0),
         dest_h: Vec3::new(0.0, 3.0, 0.0),
         mirror: false,
+        auto: false,
     }
 }
 /// `/portal mirror`: the quad's destination is itself, so walking in puts
@@ -568,6 +672,7 @@ fn mirror_portal(feet: Vec3, yaw: f32, dim: &str, id: u32) -> Portal {
         // Same basis on both sides: the transform reduces to reflecting
         // through the portal's own plane — a mirror, not a flip.
         mirror: false,
+        auto: false,
     }
 }
 /// `/portal floor`: a 2x2 opening in the ground ahead; falling in drops
@@ -586,6 +691,7 @@ fn floor_pair(feet: Vec3, yaw: f32, dim: &str, next: &mut u32) -> (Portal, Porta
         dest_w: Vec3::ZERO,
         dest_h: Vec3::ZERO,
         mirror: false,
+        auto: false,
     };
     let b = Portal {
         center: a

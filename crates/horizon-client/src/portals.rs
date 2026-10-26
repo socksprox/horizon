@@ -114,6 +114,9 @@ pub struct Portal {
     /// Mirror portals: the horizontal axis flips and the view shows the
     /// world reflected across the portal plane.
     pub mirror: bool,
+    /// A lit nether-portal frame: shows through but vanilla's own travel
+    /// (the stand-in timer) still owns the trip.
+    pub auto: bool,
 }
 
 /// The four corners of a portal quad, for rendering.
@@ -353,7 +356,7 @@ pub fn encode(portals: &[Portal]) -> Vec<u8> {
                 out.extend_from_slice(&c.to_le_bytes());
             }
         }
-        out.push(u8::from(p.mirror));
+        out.push(u8::from(p.mirror) | (u8::from(p.auto) << 1));
     }
     out
 }
@@ -375,6 +378,7 @@ pub fn decode(data: &[u8]) -> Option<Vec<Portal>> {
             *c = cur.f64()?;
         }
         let v = |i: usize| Vec3::new(f64s[i], f64s[i + 1], f64s[i + 2]);
+        let flags = cur.u8()?;
         portals.push(Portal {
             id,
             dim,
@@ -385,7 +389,8 @@ pub fn decode(data: &[u8]) -> Option<Vec<Portal>> {
             dest_center: v(9),
             dest_w: v(12),
             dest_h: v(15),
-            mirror: cur.u8()? != 0,
+            mirror: flags & 1 != 0,
+            auto: flags & 2 != 0,
         });
     }
     Some(portals)
@@ -448,6 +453,7 @@ pub fn pair(
         dest_w: b.w,
         dest_h: b.h,
         mirror: a.mirror,
+        auto: a.auto,
     };
     let b_to_a = Portal {
         id: b.id,
@@ -460,6 +466,7 @@ pub fn pair(
         dest_w: a.w,
         dest_h: a.h,
         mirror: b.mirror,
+        auto: b.auto,
     };
     (a_to_b, b_to_a)
 }
