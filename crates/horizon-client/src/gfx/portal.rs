@@ -35,6 +35,11 @@ pub struct View {
     /// Which resident world to draw: the current one (0), or a remote
     /// world the client also holds (`remote` index + 1).
     pub world: usize,
+    /// The outer view this view shows through, if this is a nested
+    /// portal-in-portal view: its index in the frame's view list. Inner
+    /// views render first and the parent's pass samples their target.
+    /// `corners` then hold the inner quad in the parent's camera space.
+    pub parent: Option<usize>,
 }
 
 /// `self.portal_targets` slots that survive until a resize; one per `View`.
@@ -204,6 +209,7 @@ impl Renderer {
         view: &View,
         base: &Globals,
         visible: &[super::resident::Visible],
+        views: &[View],
     ) {
         let Some(target) = self.portal_targets.get(i) else {
             return;
@@ -346,6 +352,41 @@ impl Renderer {
             pass.set_bind_group(0, &self.entity_group, &[]);
             pass.set_vertex_buffer(0, self.portal_entities.slice(..));
             pass.draw_indexed(0..(entity_quads as u32) * 6, 0, 0..1);
+            pass.set_bind_group(0, &target.world_group, &[]);
+        }
+        // Portal-in-portal: inner views rendered into their targets already
+        // (view passes run in reverse index order, deepest first); the
+        // inner quad samples that target through this pass's camera.
+        for (j, inner) in views.iter().enumerate() {
+            if inner.parent != Some(i) {
+                continue;
+            }
+            let Some(itarget) = self.portal_targets.get(j) else {
+                continue;
+            };
+            let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Portal inner quad"),
+                layout: &self.portal_quad_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: target.globals.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&itarget.color_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sprite_sampler),
+                    },
+                ],
+            });
+            pass.set_pipeline(&self.portal_quad);
+            pass.set_bind_group(0, &group, &[]);
+            pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_vertex_buffer(0, self.portal_quads.slice(..));
+            pass.draw_indexed(0..6, (j * 4) as i32, 0..1);
             pass.set_bind_group(0, &target.world_group, &[]);
         }
     }

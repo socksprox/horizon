@@ -292,39 +292,77 @@ impl Game<'_> {
                 // far side: draw nothing rather than the wrong world.
                 continue;
             }
-            specs.push((corners, dcam, view_proj, world, p.dest_dim.clone()));
+            specs.push((
+                corners,
+                dcam,
+                (dyaw, dpitch),
+                view_proj,
+                world,
+                p.dest_dim.clone(),
+                None,
+            ));
         }
+        // One level of portal-in-portal: each same-dimension view can show
+        // another portal, its view rendered into its own target first and
+        // sampled by the inner quad in the parent's pass. Remote worlds'
+        // portal lists aren't synced, so recursion stays in-dimension.
+        let outer = specs.len();
+        let mut inner_specs = Vec::new();
+        for oi in 0..outer {
+            if specs.len() + inner_specs.len() >= gfx::portal::MAX_VIEWS || specs[oi].4 != 0 {
+                continue;
+            }
+            let (dcam, (dyaw, dpitch), outer_vp) = (specs[oi].1, specs[oi].2, specs[oi].3);
+            inner_specs.extend(
+                self.inner_portal_specs(
+                    dcam,
+                    dyaw,
+                    dpitch,
+                    fov_degrees,
+                    aspect,
+                    depth_far,
+                    bob,
+                    outer_vp,
+                )
+                .into_iter()
+                .map(|s| (s.0, s.1, s.2, s.3, s.4, s.5, Some(oi))),
+            );
+        }
+        specs.extend(inner_specs);
         let sky_env = self.settings.horizon.sky;
         let t = self.world.day_time;
         specs
             .into_iter()
-            .map(|(corners, dcam, view_proj, world, dest_dim)| View {
-                corners,
-                camera: glam::DVec3::new(dcam.x, dcam.y, dcam.z),
-                view_proj,
-                // The far side's own sky and fog: a nether view renders
-                // nether gloom, not the overworld's.
-                sky: if world == 0 {
-                    None
-                } else {
-                    Some(match dest_dim.as_str() {
-                        "minecraft:the_nether" => {
-                            self.res.nether_environment().sample(t, None, None)
-                        }
-                        "minecraft:the_end" => self.res.end_environment().sample(t, None, None),
-                        _ => self.res.environment().sample(t, None, None),
-                    })
+            .map(
+                |(corners, dcam, (_dyaw, _dpitch), view_proj, world, dest_dim, parent)| View {
+                    corners,
+                    camera: glam::DVec3::new(dcam.x, dcam.y, dcam.z),
+                    view_proj,
+                    // The far side's own sky and fog: a nether view renders
+                    // nether gloom, not the overworld's.
+                    sky: if world == 0 {
+                        None
+                    } else {
+                        Some(match dest_dim.as_str() {
+                            "minecraft:the_nether" => {
+                                self.res.nether_environment().sample(t, None, None)
+                            }
+                            "minecraft:the_end" => self.res.end_environment().sample(t, None, None),
+                            _ => self.res.environment().sample(t, None, None),
+                        })
+                    },
+                    skybox: sky_env && dest_dim == "minecraft:overworld",
+                    // Entities for this view, baked against its camera — the
+                    // oblique clip keeps the near side out too.
+                    entities: self.entity_geometry(
+                        glam::DVec3::new(dcam.x, dcam.y, dcam.z),
+                        alpha,
+                        Vec::new(),
+                    ),
+                    world,
+                    parent,
                 },
-                skybox: sky_env && dest_dim == "minecraft:overworld",
-                // Entities for this view, baked against its camera — the
-                // oblique clip keeps the near side out too.
-                entities: self.entity_geometry(
-                    glam::DVec3::new(dcam.x, dcam.y, dcam.z),
-                    alpha,
-                    Vec::new(),
-                ),
-                world,
-            })
+            )
             .collect()
     }
 
@@ -534,6 +572,58 @@ impl Game<'_> {
                     }
                 }
             }
+        }
+        out
+    }
+
+    /// Portals visible through an outer view's own camera — the
+    /// portal-in-portal specs: inner quads in the parent's camera space,
+    /// each inner view rendering into its own target first. In-dimension
+    /// only: remote worlds' portal lists are not synced to the client.
+    fn inner_portal_specs(
+        &self,
+        dcam: Vec3,
+        dyaw: f32,
+        dpitch: f32,
+        fov_degrees: f32,
+        aspect: f32,
+        depth_far: f32,
+        bob: glam::Mat4,
+        outer_vp: glam::Mat4,
+    ) -> Vec<([[f32; 3]; 4], Vec3, (f32, f32), glam::Mat4, usize, String)> {
+        let dim = self.dim.id();
+        let mut out = Vec::new();
+        for p in &self.imm_portals {
+            if p.dim != dim || p.dest_dim != dim || p.side_distance(dcam) <= -0.25 {
+                continue;
+            }
+            let Some(quad) = p.quad() else { continue };
+            let corners: [[f32; 3]; 4] = std::array::from_fn(|i| {
+                let c = quad.corners[i].subtract(dcam);
+                [c.x as f32, c.y as f32, c.z as f32]
+            });
+            if !Self::quad_in_frustum(&corners, outer_vp) {
+                continue;
+            }
+            let (icam, iyaw, ipitch) = p.view_camera(dcam, dyaw, dpitch);
+            let view = horizon_client::camera::view_matrix(iyaw, ipitch);
+            let Some(dq) = p.dest_quad() else { continue };
+            let n = dq.normal;
+            let cam_rel = Vec3::new(dq.corners[0].x, dq.corners[0].y, dq.corners[0].z)
+                .lerp(
+                    Vec3::new(dq.corners[2].x, dq.corners[2].y, dq.corners[2].z),
+                    0.5,
+                )
+                .subtract(icam);
+            let rn = view.transform_vector3(glam::Vec3::new(n.x as f32, n.y as f32, n.z as f32));
+            let d = -(n.x * cam_rel.x + n.y * cam_rel.y + n.z * cam_rel.z) as f32;
+            let clip = glam::Vec4::new(rn.x, rn.y, rn.z, d);
+            let view_proj = horizon_client::gfx::portal::oblique(
+                horizon_client::gfx::world_projection(fov_degrees, aspect, depth_far),
+                clip,
+            ) * bob
+                * view;
+            out.push((corners, icam, (iyaw, ipitch), view_proj, 0, dim.to_owned()));
         }
         out
     }

@@ -3950,7 +3950,11 @@ impl Renderer {
         let portal_views = frame.portal_views.len().min(portal::MAX_VIEWS);
         let portal_views = self.portal_targets(portal_views).min(portal_views);
         let mut portal_vis = std::mem::take(&mut self.visible);
-        for (i, view) in frame.portal_views[..portal_views].iter().enumerate() {
+        // Inner (portal-in-portal) views render into their targets first so
+        // the parent's pass can sample them: reverse index order works
+        // because inner specs always come after their parents.
+        for i in (0..portal_views).rev() {
+            let view = &frame.portal_views[i];
             portal_vis.clear();
             self.sections_for(view.world).visible(
                 view.camera,
@@ -3968,7 +3972,14 @@ impl Renderer {
                 (i * 4 * 12) as u64,
                 bytemuck::cast_slice(&view.corners),
             );
-            self.draw_portal_world(&mut encoder, i, view, &globals, &portal_vis);
+            self.draw_portal_world(
+                &mut encoder,
+                i,
+                view,
+                &globals,
+                &portal_vis,
+                &frame.portal_views[..portal_views],
+            );
         }
         portal_vis.clear();
         self.visible = portal_vis;
@@ -4229,6 +4240,10 @@ impl Renderer {
             // See-through portals: each quad samples its offscreen view,
             // over translucent terrain so water does not cover the opening.
             for i in 0..portal_views {
+                // Inner views draw inside their parent's pass instead.
+                if frame.portal_views[i].parent.is_some() {
+                    continue;
+                }
                 pass.set_pipeline(&self.portal_quad);
                 pass.set_bind_group(0, &self.portal_targets[i].group, &[]);
                 pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
