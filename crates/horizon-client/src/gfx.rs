@@ -514,6 +514,9 @@ pub struct Renderer {
     /// Resident sections of remote worlds `remote` streams for portals
     /// (`portal::View::world` = index + 1).
     portal_worlds: Vec<resident::Resident<SectionGpu>>,
+    /// The empty resident `sections_for` returns for a world that isn't
+    /// streamed yet (a portal view must never fall back to the wrong one).
+    portal_empty: resident::Resident<SectionGpu>,
     /// Brightness option (lightmap gamma), 0..1.
     pub gamma: f32,
     /// Optional full-light lightmap (Horizon Extras).
@@ -2493,6 +2496,7 @@ impl Renderer {
             portal_entity_capacity: 0,
             portal_sprite_views: sprite_views.clone(),
             portal_worlds: Vec::new(),
+            portal_empty: resident::Resident::default(),
             occlusion: occlusion::Occlusion::new(crate::chunk::MIN_Y, crate::chunk::HEIGHT / 16),
             world_post,
             pack_post: None,
@@ -2841,12 +2845,16 @@ impl Renderer {
         }
     }
     /// The resident sections a `portal::View::world` draws: the current
-    /// world (0) or a remote world streamed for a portal (index + 1).
+    /// world (0) or a remote world streamed for a portal (index + 1). A
+    /// missing remote world draws nothing — never the wrong world's.
     fn sections_for(&self, world: usize) -> &resident::Resident<SectionGpu> {
-        world
-            .checked_sub(1)
-            .and_then(|i| self.portal_worlds.get(i))
-            .unwrap_or(&self.sections)
+        if world == 0 {
+            &self.sections
+        } else {
+            self.portal_worlds
+                .get(world - 1)
+                .unwrap_or(&self.portal_empty)
+        }
     }
     /// `self.portal_worlds[at]` (creating it) plus this world's streaming
     /// bookkeeping — for `game/remote_worlds.rs`.
