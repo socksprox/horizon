@@ -292,17 +292,30 @@ impl Game<'_> {
                 // far side: draw nothing rather than the wrong world.
                 continue;
             }
-            specs.push((corners, dcam, view_proj, world));
+            specs.push((corners, dcam, view_proj, world, p.dest_dim.clone()));
         }
-        let skybox = self.dim == Dim::Overworld && self.settings.horizon.sky;
+        let sky_env = self.settings.horizon.sky;
+        let t = self.world.day_time;
         specs
             .into_iter()
-            .map(|(corners, dcam, view_proj, world)| View {
+            .map(|(corners, dcam, view_proj, world, dest_dim)| View {
                 corners,
                 camera: glam::DVec3::new(dcam.x, dcam.y, dcam.z),
                 view_proj,
-                sky: None,
-                skybox,
+                // The far side's own sky and fog: a nether view renders
+                // nether gloom, not the overworld's.
+                sky: if world == 0 {
+                    None
+                } else {
+                    Some(match dest_dim.as_str() {
+                        "minecraft:the_nether" => {
+                            self.res.nether_environment().sample(t, None, None)
+                        }
+                        "minecraft:the_end" => self.res.end_environment().sample(t, None, None),
+                        _ => self.res.environment().sample(t, None, None),
+                    })
+                },
+                skybox: sky_env && dest_dim == "minecraft:overworld",
                 // Entities for this view, baked against its camera — the
                 // oblique clip keeps the near side out too.
                 entities: self.entity_geometry(
