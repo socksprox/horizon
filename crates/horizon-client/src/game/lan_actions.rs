@@ -40,6 +40,11 @@ pub(super) struct GuestPlay {
     use_delay: u32,
     /// The shield's ItemCooldowns entry: an axe disabled it for this many ticks.
     pub(super) shield_cooldown: u32,
+    /// `ServerGamePacketListenerImpl.dropSpamThrottler` (`TickThrottler(20, 1480)`): 20 for each
+    /// item a creative player drops from the creative screen, one less each tick.
+    creative_drops: u32,
+    /// The guest's `Player.getCooldowns()` (`Game::cooldowns` for its turn).
+    pub(super) cooldowns: horizon_client::cooldowns::Cooldowns,
     attack_ticks: u32,
     /// The main hand's item at the guest's last tick (`Game::attack_item`).
     attack_item: Option<std::sync::Arc<str>>,
@@ -86,6 +91,7 @@ pub(super) struct GuestPlay {
     equipped: Option<Vec<Option<ItemStack>>>,
     /// The guest's cast fishing hook (`Player.fishing`).
     pub(super) hook: Option<super::fishing::Hook>,
+    sculk: super::sculk::PlayerEvents,
 }
 
 /// A guest's command waiting for the hub (`LanHost::commands`).
@@ -127,6 +133,8 @@ pub(super) struct GuestSwap {
     using: Option<(usize, u32)>,
     use_delay: u32,
     pub(super) shield_cooldown: u32,
+    /// The guest's item cooldowns (`Game::cooldowns` for its turn).
+    cooldowns: horizon_client::cooldowns::Cooldowns,
     attack_ticks: u32,
     attack_item: Option<std::sync::Arc<str>>,
     swing: horizon_client::first_person::SwingState,
@@ -254,6 +262,7 @@ impl Game<'_> {
         if fresh {
             // A new body (joined, respawned, changed level): nothing on it yet.
             play.equipped = None;
+            play.sculk = Default::default();
         }
         let g = &mut host.hub.guests[i];
         // The guest's body.
@@ -261,6 +270,7 @@ impl Game<'_> {
             host.play.insert(conn, play);
             return None;
         };
+        self.sculk.swap_player(&mut play.sculk);
         // The guest's own CombatTracker: damage to them is not the host's.
         // A new body starts with no record of the last one.
         let guest_combat = if fresh {
@@ -330,6 +340,7 @@ impl Game<'_> {
         let using = std::mem::replace(&mut self.using, play.using.take());
         let use_delay = std::mem::replace(&mut self.use_delay, play.use_delay);
         let shield_cooldown = std::mem::replace(&mut self.shield_cooldown, play.shield_cooldown);
+        let cooldowns = std::mem::replace(&mut self.cooldowns, std::mem::take(&mut play.cooldowns));
         let attack_ticks = std::mem::replace(&mut self.attack_ticks, play.attack_ticks);
         let attack_item = std::mem::replace(&mut self.attack_item, play.attack_item.take());
         let swing = std::mem::replace(&mut self.swing, play.swing);
@@ -414,6 +425,7 @@ impl Game<'_> {
             using,
             use_delay,
             shield_cooldown,
+            cooldowns,
             attack_ticks,
             attack_item,
             swing,
@@ -471,6 +483,7 @@ impl Game<'_> {
             using,
             use_delay,
             shield_cooldown,
+            cooldowns,
             attack_ticks,
             attack_item,
             swing,
@@ -494,6 +507,7 @@ impl Game<'_> {
             projectiles,
             modifiers,
         } = swap;
+        self.sculk.swap_player(&mut play.sculk);
         // The guest's damage record back into their slot, the host's in place.
         let guest_combat = std::mem::replace(&mut self.combat, combat);
         self.guest_combat.insert(conn, guest_combat);
@@ -509,6 +523,16 @@ impl Game<'_> {
         self.swings_started = swings;
         for packet in std::mem::replace(&mut self.guest_packets, packets) {
             host.hub.send_to(conn, &packet);
+        }
+        // ServerItemCooldowns.onCooldownStarted: the guest's own cooldown.
+        for (group, duration) in std::mem::take(&mut self.guest_cooldowns) {
+            host.hub.send_to(
+                conn,
+                &C::Cooldown(play::Cooldown {
+                    group: group.to_string(),
+                    duration,
+                }),
+            );
         }
         (self.lan_acting, self.lan_acting_name, self.lan_acting_uuid) = acting;
         play.death_cause = std::mem::replace(&mut self.ui.death_cause, death_cause);
@@ -539,6 +563,7 @@ impl Game<'_> {
         play.using = std::mem::replace(&mut self.using, using);
         play.use_delay = std::mem::replace(&mut self.use_delay, use_delay);
         play.shield_cooldown = std::mem::replace(&mut self.shield_cooldown, shield_cooldown);
+        play.cooldowns = std::mem::replace(&mut self.cooldowns, cooldowns);
         play.attack_ticks = std::mem::replace(&mut self.attack_ticks, attack_ticks);
         play.attack_item = std::mem::replace(&mut self.attack_item, attack_item);
         play.swing = std::mem::replace(&mut self.swing, swing);
@@ -1066,6 +1091,35 @@ impl Game<'_> {
             }
             S::MoveVehicle(p) => self.guest_move_vehicle(host, conn, &p),
             S::PaddleBoat(p) => self.guest_paddle_boat(host, conn, [p.left, p.right]),
+            // handleSetCreativeModeSlot's drop: a slot below 0 is a stack thrown out of the
+            // creative screen (`handleCreativeModeItemDrop`), dropped from the player's hand.
+            S::SetCreativeModeSlot(p) if p.slot < 0 => {
+                if !host.hub.guests[gi].creative() {
+                    return;
+                }
+                let Some(stack) = self.item_from_network(host, &p.item) else {
+                    return;
+                };
+                if stack.count
+                    > self
+                        .res
+                        .items()
+                        .get(&stack.item)
+                        .map_or(64, |i| i.max_stack)
+                {
+                    return;
+                }
+                let play = host.play.entry(conn).or_default();
+                if play.creative_drops >= 1480 {
+                    eprintln!(
+                        "Player {} was dropping items too fast in creative mode, ignoring.",
+                        host.hub.guests[gi].name
+                    );
+                    return;
+                }
+                play.creative_drops += 20;
+                self.as_guest(host, conn, |g| g.player_drop(stack));
+            }
             S::SetCreativeModeSlot(p) => {
                 let g = &mut host.hub.guests[gi];
                 if !g.creative() || !(0..46).contains(&p.slot) {
@@ -1820,8 +1874,20 @@ impl Game<'_> {
             }
             let play = host.play.entry(conn).or_default();
             // Player.tick's ItemCooldowns.tick, once a tick for each player
-            // (the shield an axe disabled).
+            // (the shield an axe disabled, a thrown pearl).
             play.shield_cooldown = play.shield_cooldown.saturating_sub(1);
+            play.creative_drops = play.creative_drops.saturating_sub(1);
+            // ServerItemCooldowns.onCooldownEnded: a finished entry is told to
+            // the guest (a duration of 0 removes it).
+            for group in play.cooldowns.tick() {
+                host.hub.send_to(
+                    conn,
+                    &C::Cooldown(play::Cooldown {
+                        group: group.to_string(),
+                        duration: 0,
+                    }),
+                );
+            }
             let digging = play.digging;
             let using = play.using.is_some();
             let delayed = play.destroy_delay > 0 || play.use_delay > 0 || play.attack_ticks < 100;
@@ -2150,6 +2216,12 @@ impl Game<'_> {
             let _ = w.apply_fire_contact();
             let _ = w.server_hazards_tick(in_wall);
             let mut events = std::mem::take(&mut w.player.events);
+            // LayeredCauldronBlock.handleEntityOnFireInside along those moves.
+            for event in &events {
+                if let MotionEvent::CauldronExtinguish { pos } = event {
+                    game.cauldron_extinguish(*pos);
+                }
+            }
             // WitherRoseBlock.entityInside along those moves.
             for event in &events {
                 if matches!(event, MotionEvent::InsideWitherRose) {
@@ -2191,6 +2263,7 @@ impl Game<'_> {
         let Some((events, marked)) = events else {
             return;
         };
+        self.as_guest(host, conn, |game| game.tick_player_sculk_events());
         for event in events {
             match event {
                 MotionEvent::HurtSound(sound) => self.player_hurt_sound(sound, at),

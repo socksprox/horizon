@@ -78,12 +78,17 @@ impl Game<'_> {
                 .map(|id| r.registries.dimension(id))
         });
         match d {
-            Some(d) => match self.remote_chunk_for(&packet, &d) {
-                Ok(chunk) => {
+            Some(d) => match self
+                .remote
+                .as_ref()
+                .map(|r| r.chunk_format.with_dimension(&d).column(&packet))
+            {
+                Some(Ok(chunk)) => {
                     let rw = &mut self.remote_worlds[i];
                     rw.streaming.insert_remote(&mut rw.world, chunk);
                 }
-                Err(e) => log::warn!("Horizon: remote chunk {dim}: {e}"),
+                Some(Err(e)) => log::warn!("Horizon: remote chunk {dim}: {e}"),
+                None => log::warn!("Horizon: remote chunk {dim}: no connection"),
             },
             None => log::warn!("Horizon: remote chunk for unknown {dim_type}"),
         }
