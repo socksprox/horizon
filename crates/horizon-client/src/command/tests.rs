@@ -603,10 +603,11 @@ fn horizon_commands_are_off_unless_the_server_turns_them_on() {
         let d = vanilla::game_tree(dev, true);
         let parse = d.parse("pregen start 100 circle", &reg());
         assert_eq!(parse.executable().unwrap().1, "pregen.start");
-        // Vanilla's commands are the same with or without it.
+        // Vanilla's commands are the same with or without Horizon's
+        // additions (`pregen`, `portal`).
         assert_eq!(
             d.nodes[0].children.len(),
-            vanilla_tree.nodes[0].children.len() + 1
+            vanilla_tree.nodes[0].children.len() + 2
         );
     }
 }
