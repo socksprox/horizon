@@ -59,17 +59,23 @@ pub(super) struct Target {
 pub fn oblique(proj: Mat4, plane: Vec4) -> Mat4 {
     let c = if plane.w < 0.0 { plane } else { -plane };
     let sign = |x: f32| if x >= 0.0 { 1.0f32 } else { -1.0f32 };
-    let q = Vec4::new(
-        (sign(c.x) + proj.z_axis.x) / proj.x_axis.x,
-        (sign(c.y) + proj.z_axis.y) / proj.y_axis.y,
-        -1.0,
-        (1.0 + proj.z_axis.z) / proj.w_axis.z,
-    );
+    // Where the camera's near and far planes land in clip z, probed
+    // through `proj` itself — correct for every depth convention
+    // (0..1, -1..1, and this renderer's reversed z).
+    let probe = |z: f32| {
+        let v = proj * Vec4::new(0.0, 0.0, z, 1.0);
+        v.z / v.w
+    };
+    let (nz, fz) = (probe(-0.05), probe(-1.0e6));
+    // Q: the frustum's near-plane corner in camera space, un-projected.
+    let q = proj.inverse() * Vec4::new(sign(c.x), sign(c.y), nz, 1.0);
     let c2 = c * (2.0 / c.dot(q));
+    // The z-producing column becomes the clip plane; `fz` keeps the far
+    // clip where it was (Terathon's `+1` for the -1..1 convention).
     Mat4::from_cols(
         proj.x_axis,
         proj.y_axis,
-        Vec4::new(c2.x, c2.y, c2.z + 1.0, c2.w),
+        Vec4::new(c2.x, c2.y, c2.z + fz, c2.w),
         proj.w_axis,
     )
 }

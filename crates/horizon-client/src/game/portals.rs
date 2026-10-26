@@ -48,18 +48,39 @@ impl Game<'_> {
         self.portal_sync_dirty = true;
     }
     /// Push the level's portal list to every placed guest when it changed
-    /// (`tick_world`); clients filter it to their own dimension.
+    /// or they have not been sent it yet (`tick_world`); clients filter
+    /// it to their own dimension.
     pub(super) fn sync_portals(&mut self) {
-        if !self.portal_sync_dirty {
+        if self.lan.is_none() {
+            self.portal_sync_dirty = false;
             return;
         }
-        let packet = self.portals_packet();
-        if let Some(host) = &self.lan {
-            for g in &host.hub.guests {
-                if g.placed {
-                    g.send(&packet);
-                }
+        let changed = self.portal_sync_dirty;
+        let conns: Vec<u32> = self
+            .lan
+            .as_ref()
+            .map(|h| {
+                h.hub
+                    .guests
+                    .iter()
+                    .filter(|g| g.placed)
+                    .map(|g| g.conn)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for conn in conns {
+            if !changed && self.portal_synced.contains(&conn) {
+                continue;
             }
+            let packet = self.portals_packet();
+            if let Some(g) = self
+                .lan
+                .as_ref()
+                .and_then(|h| h.hub.guests.iter().find(|g| g.conn == conn))
+            {
+                g.send(&packet);
+            }
+            self.portal_synced.insert(conn);
         }
         self.portal_sync_dirty = false;
     }
@@ -254,12 +275,13 @@ impl Game<'_> {
             ));
             let d = -(n.x * cam_rel.x + n.y * cam_rel.y + n.z * cam_rel.z) as f32;
             let clip = glam::Vec4::new(rn.x, rn.y, rn.z, d);
+            // The clip plane folds into the bare projection; bob and the
+            // view's own rotation apply after it.
             let view_proj = horizon_client::gfx::portal::oblique(
-                horizon_client::gfx::world_view_projection(
-                    aspect, fov_degrees, dyaw, dpitch, bob, depth_far,
-                ),
+                horizon_client::gfx::world_projection(fov_degrees, aspect, depth_far),
                 clip,
-            );
+            ) * bob
+                * horizon_client::camera::view_matrix(dyaw, dpitch);
             let world = self.portal_world_index(&p.dest_dim);
             if world == usize::MAX {
                 // Cross-dimension view before `remote_worlds` streams the

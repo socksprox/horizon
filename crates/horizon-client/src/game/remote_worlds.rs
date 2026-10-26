@@ -149,6 +149,20 @@ impl Game<'_> {
     /// column they have not been sent.
     pub(super) fn stream_remote_worlds(&mut self) {
         let active = self.dim.id();
+        // Columns this level's edits touched are stale in any guest's
+        // remote copy of it (another level streams it through a portal):
+        // forget them so the send below re-pushes (`block_log` is this
+        // tick's changes, before `broadcast_block_changes` drains it).
+        if let Some(log) = &self.world.block_log
+            && !log.is_empty()
+        {
+            let touched: HashSet<(i32, i32)> =
+                log.iter().map(|p| (p.0 >> 4, p.2 >> 4)).collect();
+            let dim = active.to_owned();
+            for sent in self.remote_sent.values_mut() {
+                sent.retain(|(d, x, z)| *d != dim || !touched.contains(&(*x, *z)));
+            }
+        }
         // (destination dim, chunk x, chunk z) around every exit.
         let want: Vec<(Dim, i32, i32)> = self
             .imm_portals
@@ -180,6 +194,7 @@ impl Game<'_> {
             let Some(host) = self.lan.as_mut() else {
                 return;
             };
+            // Guests in another level get this level's blocks live.
             let d = horizon_protocol::registry::DimensionType::vanilla(dim.id());
             host.hub.encoder.set_dimension(d.min_y, d.height, d.has_skylight);
             let dim_name = dim.id().to_owned();

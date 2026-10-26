@@ -3096,9 +3096,10 @@ impl Renderer {
         clip_plane: Vec4,
     ) -> Mat4 {
         portal::oblique(
-            self.projection(fov_degrees, yaw, pitch, bob, depth_far),
+            world_projection(fov_degrees, self.aspect(), depth_far),
             clip_plane,
-        )
+        ) * bob
+            * crate::camera::view_matrix(yaw, pitch)
     }
     /// The view frustum `render` will cull with, for culling geometry built
     /// before the frame (entities, block entities) the same way.
@@ -4648,7 +4649,9 @@ fn camera_section(camera: DVec3) -> SectionKey {
     )
 }
 
-fn world_projection(fov_degrees: f32, aspect: f32, far: f32) -> Mat4 {
+/// The world's projection alone (`view * bob` are applied after it), for
+/// portal code folding a clip plane into it before the view goes on.
+pub fn world_projection(fov_degrees: f32, aspect: f32, far: f32) -> Mat4 {
     Mat4::perspective_rh(fov_degrees.to_radians(), aspect, far, 0.05)
 }
 
