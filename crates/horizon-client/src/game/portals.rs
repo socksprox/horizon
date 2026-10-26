@@ -18,12 +18,6 @@ use horizon_client::{
 use horizon_core::geometry::Vec3;
 use horizon_protocol::packets::{configuration as cfg, play};
 
-/// A remote dimension the client holds for a portal's view (`world`
-/// index + 1 in `View`); chunks stream in with `remote_worlds`.
-pub(super) struct RemoteDim {
-    pub dim: String,
-}
-
 /// How far past a portal's bounds a crossing still counts: the player's
 /// 0.6m box, halved, plus a step.
 const CROSS_MARGIN: f64 = 0.5;
@@ -76,10 +70,30 @@ impl Game<'_> {
             data: portals::encode(&self.imm_portals),
         })
     }
-    /// A crossing into another dimension (`tick_portal_crossing`): the
-    /// server's travel machinery moves the player and the client follows
-    /// (`server_travel`); filled in with cross-dimension portals.
-    pub(super) fn request_portal_travel(&mut self, _portal: u32) {}
+    /// A crossing into another dimension (`tick_portal_crossing`). Remote
+    /// clients wait for the server: it sees the same crossing from the
+    /// move packets and runs the level teleport (`tick_guests`). In-frame,
+    /// this Game is both sides and moves itself.
+    pub(super) fn request_portal_travel(&mut self, id: u32) {
+        let Some(p) = self.imm_portals.iter().find(|p| p.id == id).cloned() else {
+            return;
+        };
+        if self.remote.is_some() || self.serving.is_some() {
+            return;
+        }
+        let dim = Dim::from_id(&p.dest_dim);
+        if let Err(e) = self.enter_level(None, dim) {
+            log::error!("portal travel to {}: {e}", p.dest_dim);
+            return;
+        }
+        if let Some(player) = self.player.as_mut() {
+            player.position = p.transform_point(player.position);
+            player.velocity = p.transform_dir(player.velocity);
+        }
+        let (yaw, pitch) = p.transform_yaw_pitch(self.yaw, self.pitch);
+        self.yaw = yaw;
+        self.pitch = pitch;
+    }
     /// A remote client's portals list, wholesale (what the server sent).
     pub(super) fn set_remote_portals(&mut self, list: Vec<Portal>) {
         self.imm_portals = list;
@@ -126,6 +140,17 @@ impl Game<'_> {
             aspect, fov_degrees, yaw, pitch, bob, depth_far,
         );
         let dim = self.dim.id();
+        // Remote worlds exist before the borrow: a cross-dimension view's
+        // `world` resolves to one even before its chunks land.
+        let dest_dims: Vec<String> = self
+            .imm_portals
+            .iter()
+            .filter(|p| p.dim == dim && p.dest_dim != dim)
+            .map(|p| p.dest_dim.clone())
+            .collect();
+        for d in dest_dims {
+            self.ensure_remote_world(&d, &d);
+        }
         let mut by_distance: Vec<&Portal> = self
             .imm_portals
             .iter()
@@ -215,8 +240,8 @@ impl Game<'_> {
     }
 
     /// Which resident world a `View::world` draws: the current one (0), or
-    /// a streamed remote world. Remote worlds come with the cross-
-    /// dimension milestone; until then every view draws the current one.
+    /// a remote world (created on demand so a new portal shows sky before
+    /// its chunks land).
     fn portal_world_index(&self, dest_dim: &str) -> usize {
         if dest_dim == self.dim.id() {
             0

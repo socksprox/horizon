@@ -5,7 +5,7 @@
 //! blocks, attacking and the commands all behave exactly as they do for the
 //! host, and every world change they cause reaches all players through the
 //! block log, the level events and the entity tracker.
-use super::{Game, GuestUse, Hit, Mining, Screen, lan::LanHost, respawn_anchor::RespawnConfig};
+use super::{Dim, Game, GuestUse, Hit, Mining, Screen, lan::LanHost, respawn_anchor::RespawnConfig};
 use horizon_client::{
     command::vanilla,
     containers::BlockEntity,
@@ -1760,6 +1760,44 @@ impl Game<'_> {
         self.lan_containers_tick(host);
         self.tick_lan_mount_menus(host);
         self.announce_guest_advancements(host);
+        // See-through portals: a guest's move that crossed a portal's quad
+        // sends them through it. Same-dimension crossings arrive already
+        // transformed (the client moved itself); cross-dimension ones are
+        // the server's to run (`server_travel`).
+        let dim = self.dim.id();
+        let dim_owned = dim.to_owned();
+        for g in &host.hub.guests {
+            if !host.hub.here(g) || !g.loaded || g.dead {
+                continue;
+            }
+            let from = Vec3::new(
+                g.previous_position[0],
+                g.previous_position[1] + super::portals::CROSS_HEIGHT,
+                g.previous_position[2],
+            );
+            let to = Vec3::new(
+                g.position[0],
+                g.position[1] + super::portals::CROSS_HEIGHT,
+                g.position[2],
+            );
+            let Some(p) =
+                Game::crossed_in(&self.imm_portals, &dim_owned, from, to).cloned()
+            else {
+                continue;
+            };
+            if p.dest_dim == dim_owned {
+                continue;
+            }
+            let feet = Vec3::new(g.position[0], g.position[1], g.position[2]);
+            let at = p.transform_point(feet);
+            let (yaw, pitch) = p.transform_yaw_pitch(g.yaw, g.pitch);
+            self.level_teleports.push(super::server_travel::LevelTeleport {
+                conn: g.conn,
+                dim: Dim::from_id(&p.dest_dim),
+                at: [at.x, at.y, at.z],
+                rotation: Some([yaw, pitch]),
+            });
+        }
         let conns: Vec<u32> = host
             .hub
             .guests

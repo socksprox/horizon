@@ -133,6 +133,7 @@ mod remote_mob_use;
 mod remote_objects;
 mod remote_projectiles;
 mod remote_stations;
+mod remote_worlds;
 mod remote_vehicles;
 mod render_control;
 mod render_tick;
@@ -1524,7 +1525,9 @@ struct Game<'a> {
     /// (`apply_portal_travel` runs it).
     portal_travel_request: Option<u32>,
     /// Remote dimensions a portal's view streams (`game/remote_worlds.rs`).
-    remote_worlds: Vec<portals::RemoteDim>,
+    remote_worlds: Vec<remote_worlds::RemoteDim>,
+    /// Server side: the remote-world columns each guest already has.
+    remote_sent: HashMap<u32, HashSet<(String, i32, i32)>>,
     /// Connected to a server: the world comes from the network (game/remote.rs).
     remote: Option<remote::Remote>,
     /// This world is open to the network (game/lan.rs).
@@ -4462,6 +4465,7 @@ impl Game<'_> {
     fn tick_world(&mut self, running: bool) -> Result<()> {
         self.apply_portal_travel();
         self.sync_portals();
+        self.stream_remote_worlds();
         self.update_chunk_tickets();
         horizon_client::spans::time("tick_effects", || self.tick_effects(running));
         // Player.tick's ItemCooldowns.tick for the window's player (a
@@ -10769,6 +10773,8 @@ impl Game<'_> {
         self.tick_pregen();
         let (uploads, unloaded) =
             horizon_client::spans::time("streaming", || self.streaming.update(&mut self.world));
+        // Portal views' remote dimensions mesh beside the remote level.
+        self.update_remote_worlds();
         if let Some(lod) = &mut self.lod {
             self.lod_observe
                 .extend(uploads.iter().map(|(key, _)| (key.0, key.2)));
@@ -12184,6 +12190,7 @@ impl<'a> Game<'a> {
             portal_cooldown: 0,
             portal_travel_request: None,
             remote_worlds: Vec::new(),
+            remote_sent: HashMap::new(),
             lan_global_events: Vec::new(),
             lid_openers: HashMap::new(),
             lan_acting: None,

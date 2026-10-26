@@ -15,15 +15,79 @@
 //! not a second synced entity.
 
 use horizon_core::geometry::Vec3;
+use horizon_protocol::{
+    buf::{Codec, Reader, Writer},
+    packets::play::LevelChunkWithLight,
+};
 
 /// Wire format version of a synced `Portal` (`portal_net`).
 pub const WIRE_VERSION: u8 = 1;
+/// A remote dimension's chunk column on the wire (`horizon:remote_chunk`):
+/// version byte, the level and dimension-type names, then the
+/// LevelChunkWithLight body — the same bytes a vanilla server sends.
+pub fn encode_remote_chunk(
+    dim: &str,
+    dim_type: &str,
+    packet: &LevelChunkWithLight,
+) -> Vec<u8> {
+    let mut out = vec![WIRE_VERSION];
+    put_str(&mut out, dim);
+    put_str(&mut out, dim_type);
+    let mut w = Writer::new();
+    <LevelChunkWithLight as Codec<LevelChunkWithLight>>::write(packet, &mut w);
+    out.extend_from_slice(&w.data);
+    out
+}
+
+/// `encode_remote_chunk` with the column's body already encoded
+/// (`ChunkEncoder::body_in` output).
+pub fn encode_remote_chunk_body(dim: &str, dim_type: &str, body: Vec<u8>) -> Vec<u8> {
+    let mut out = vec![WIRE_VERSION];
+    put_str(&mut out, dim);
+    put_str(&mut out, dim_type);
+    out.extend_from_slice(&body);
+    out
+}
+
+/// `decode_remote_chunk` reverses `encode_remote_chunk`.
+pub fn decode_remote_chunk(data: &[u8]) -> Option<(String, String, LevelChunkWithLight)> {
+    let mut cur = Cursor { data, at: 0 };
+    if cur.u8()? != WIRE_VERSION {
+        return None;
+    }
+    let dim = cur.str()?.to_owned();
+    let dim_type = cur.str()?.to_owned();
+    let mut r = Reader::new(&data[cur.at..]);
+    let packet = <LevelChunkWithLight as Codec<LevelChunkWithLight>>::read(&mut r).ok()?;
+    Some((dim, dim_type, packet))
+}
+
+/// `horizon:remote_forget`: version, dim, then the column's x and z.
+pub fn encode_remote_forget(dim: &str, x: i32, z: i32) -> Vec<u8> {
+    let mut out = vec![WIRE_VERSION];
+    put_str(&mut out, dim);
+    out.extend_from_slice(&x.to_le_bytes());
+    out.extend_from_slice(&z.to_le_bytes());
+    out
+}
+
+/// `decode_remote_forget` reverses `encode_remote_forget`.
+pub fn decode_remote_forget(data: &[u8]) -> Option<(String, i32, i32)> {
+    let mut cur = Cursor { data, at: 0 };
+    if cur.u8()? != WIRE_VERSION {
+        return None;
+    }
+    let dim = cur.str()?.to_owned();
+    Some((dim, cur.i32()?, cur.i32()?))
+}
 /// Clientbound payload carrying a level's portal list.
 pub const CHANNEL: &str = "horizon:portals";
 /// Clientbound payload carrying a remote dimension's chunks (`remote_worlds`).
 pub const REMOTE_CHUNK_CHANNEL: &str = "horizon:remote_chunk";
 /// Clientbound payload carrying a remote dimension's entity positions.
 pub const REMOTE_ENTITIES_CHANNEL: &str = "horizon:remote_entities";
+/// Clientbound payload dropping a remote dimension's chunk column.
+pub const REMOTE_FORGET_CHANNEL: &str = "horizon:remote_forget";
 /// A traveller this far inside a portal's bounds already crossed last tick:
 /// a second application would bounce them back and forth.
 const CROSS_EPSILON: f64 = 1.0e-4;
@@ -344,6 +408,9 @@ impl<'a> Cursor<'a> {
     }
     fn u8(&mut self) -> Option<u8> {
         Some(self.take(1)?[0])
+    }
+    fn i32(&mut self) -> Option<i32> {
+        Some(i32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
     fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))

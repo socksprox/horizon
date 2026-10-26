@@ -62,7 +62,7 @@ fn remote_text(tag: &Tag) -> horizon_client::text::Text {
 type LightLayers = (Option<Vec<u8>>, Option<Vec<u8>>);
 
 /// Streaming needs a generator; a server world never generates.
-struct NoTerrain;
+pub(super) struct NoTerrain;
 impl ChunkGenerator for NoTerrain {
     type Worker = ();
     fn worker(&self) {}
@@ -952,13 +952,27 @@ impl Game<'_> {
 
     /// LevelChunkSection data into the client's fixed -64..320 column.
     fn remote_chunk(&self, p: &play::LevelChunkWithLight) -> std::result::Result<Chunk, String> {
+        let d = self
+            .remote
+            .as_ref()
+            .ok_or("no connection")?
+            .dimension
+            .clone();
+        self.remote_chunk_for(p, &d)
+    }
+    /// `remote_chunk` for a remote world's dimension (`remote_worlds.rs`).
+    pub(super) fn remote_chunk_for(
+        &self,
+        p: &play::LevelChunkWithLight,
+        d: &horizon_protocol::registry::DimensionType,
+    ) -> std::result::Result<Chunk, String> {
         let r = self.remote.as_ref().ok_or("no connection")?;
         let sections = p
             .chunk
-            .sections(r.dimension.sections(), 16, r.biome_bits)
+            .sections(d.sections(), 16, r.biome_bits)
             .map_err(|e| e.to_string())?;
         let mut chunk = Chunk::empty(p.x, p.z);
-        let offset = (r.dimension.min_y - MIN_Y).div_euclid(16);
+        let offset = (d.min_y - MIN_Y).div_euclid(16);
         // Biome table index per quart cell of the dimension's own sections.
         let mut biome_cells: Vec<[u32; 64]> = Vec::with_capacity(sections.len());
         for (i, s) in sections.iter().enumerate() {
@@ -1637,6 +1651,16 @@ impl Game<'_> {
                 if let Some(list) = horizon_client::portals::decode(&p.data) {
                     self.set_remote_portals(list);
                 }
+            }
+            C::CustomPayload(p)
+                if p.channel == horizon_client::portals::REMOTE_CHUNK_CHANNEL =>
+            {
+                self.remote_world_chunk(&p.data);
+            }
+            C::CustomPayload(p)
+                if p.channel == horizon_client::portals::REMOTE_FORGET_CHANNEL =>
+            {
+                self.remote_world_forget(&p.data);
             }
             C::PlayerPosition(p) => self.remote_teleport(&p)?,
             C::PlayerRotation(p) => {

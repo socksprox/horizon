@@ -108,6 +108,14 @@ pub(super) struct Levels {
     parked: HashMap<Dim, Parked>,
 }
 
+impl Levels {
+    /// A parked level's resident world, for streaming it through portals
+    /// (`game/remote_worlds.rs`).
+    pub(super) fn parked_world(&self, dim: Dim) -> Option<&World> {
+        self.parked.get(&dim).map(|p| &p.world)
+    }
+}
+
 impl Game<'_> {
     /// A new level for `dim`, opened from the save (`MinecraftServer.createLevels`).
     fn open_level(&self, dim: Dim) -> Result<Parked> {

@@ -2856,17 +2856,58 @@ impl Renderer {
         }
         &mut self.portal_worlds[at]
     }
+    /// `upload` for a remote world (`portal_worlds`): the mesh joins the
+    /// shared arena and that world's resident, with no occlusion or
+    /// block-entity bookkeeping (`upload_mesh` handles the buffers).
+    pub fn upload_portal(&mut self, key: SectionKey, mesh: &SectionMesh, world: usize) {
+        let Some(at) = world
+            .checked_sub(1)
+            .filter(|&a| a < self.portal_worlds.len())
+        else {
+            return;
+        };
+        if let Some(s) = self.portal_worlds[at].remove(key) {
+            self.release_mesh(s);
+        }
+        if let Some(section) = self.upload_mesh(mesh) {
+            self.portal_worlds[at].insert(key, section);
+        }
+    }
+    /// One section of a remote world (`horizon:remote_forget`).
+    pub fn remove_portal_section(&mut self, key: SectionKey, world: usize) {
+        if let Some(at) = world
+            .checked_sub(1)
+            .filter(|&a| a < self.portal_worlds.len())
+            && let Some(s) = self.portal_worlds[at].remove(key)
+        {
+            self.release_mesh(s);
+        }
+    }
     /// Drop a remote world's meshes from the arena (its `Resident` too).
     pub fn clear_portal_world(&mut self, at: usize) {
         if let Some(world) = self.portal_worlds.get_mut(at) {
-            let slots: Vec<u32> = (0..world.len() as u32).collect();
-            for slot in slots {
-                let s = world.get(slot);
-                let (page, start, translucent, sorted) =
-                    (s.page, s.start, s.translucent, s.sorted_indices);
-                let solid = s.solid;
+            // No `drain` on Resident: copy each section's fields out, then
+            // release them as `release_mesh` does.
+            let meshes: Vec<_> = world
+                .values()
+                .map(|s| {
+                    (
+                        s.flat_id,
+                        s.sorted_indices,
+                        s.translucent,
+                        s.page,
+                        s.start,
+                        s.solid,
+                    )
+                })
+                .collect();
+            for (flat_id, sorted, translucent, page, start, solid) in meshes {
+                if let (Some(flat), Some(id)) = (&mut self.flat, flat_id) {
+                    flat.remove(id);
+                }
                 if let Some((p, i)) = sorted {
-                    self.sorted_indices.release(p, i, u64::from(translucent) * 6);
+                    self.sorted_indices
+                        .release(p, i, u64::from(translucent) * 6);
                 }
                 self.arena
                     .release(page, start, u64::from(solid + translucent) * 4);
