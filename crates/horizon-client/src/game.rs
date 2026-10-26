@@ -4238,7 +4238,15 @@ impl Game<'_> {
             self.tick_riding(keys)?;
         }
         let riding = self.riding.is_some();
-        let entity_collisions = self.player_entity_collisions();
+        let mut entity_collisions = self.player_entity_collisions();
+        // Portals fuse their far side's blocks into the player's collision
+        // (game/portals.rs `portal_collision_boxes`).
+        entity_collisions.extend(
+            self.player
+                .as_ref()
+                .map(|p| self.portal_collision_boxes(p.bounds()))
+                .unwrap_or_default(),
+        );
         let spin_targets = self.spin_targets();
         self.sync_player_body();
         let Some(player) = self.player.as_mut() else {

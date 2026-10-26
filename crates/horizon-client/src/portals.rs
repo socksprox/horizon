@@ -222,6 +222,24 @@ impl Portal {
         (yaw, pitch)
     }
 
+    /// The same quad read backwards: `dest` becomes source, so its
+    /// transform is this portal's inverse — per-axis scales and the mirror
+    /// sign both undo themselves (used to pull far-side space local).
+    pub fn inverse(&self) -> Portal {
+        Portal {
+            id: self.id,
+            dim: self.dest_dim.clone(),
+            dest_dim: self.dim.clone(),
+            center: self.dest_center,
+            w: self.dest_w,
+            h: self.dest_h,
+            dest_center: self.center,
+            dest_w: self.w,
+            dest_h: self.h,
+            mirror: self.mirror,
+            auto: self.auto,
+        }
+    }
     /// Quad geometry: corners and the unit normal on the entry side.
     pub fn quad(&self) -> Option<Quad> {
         let (_, _, n) = self.basis()?;

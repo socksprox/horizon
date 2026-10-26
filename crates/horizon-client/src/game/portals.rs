@@ -8,12 +8,16 @@
 use super::{Dim, Game, commands::R};
 use horizon_client::command::{Context, args::Arg};
 use horizon_client::{
+    collisions::SceneCollisions,
     gfx::{self, portal::View},
     portals::{self, Portal},
     text::Text,
 };
-use horizon_core::geometry::Vec3;
+use horizon_core::geometry::{Aabb, Axis, Vec3};
+use horizon_core::position::BlockPos;
 use horizon_protocol::packets::{configuration as cfg, play};
+use horizon_world::collision_context::{CollisionContext, CollisionEntity, CollisionItem};
+use horizon_world::entity_obstruction::EntityIdentity;
 use horizon_world::nbt::{Compound, Tag};
 
 /// How far past a portal's bounds a crossing still counts: the player's
@@ -386,6 +390,139 @@ impl Game<'_> {
             id += 1;
         }
         self.portals_changed();
+    }
+
+    /// A see-through portal fuses collisions across the opening: an entity
+    /// box that reaches the plane inside the quad also meets whatever the
+    /// far side puts there, mapped back through the inverse transform into
+    /// this dimension's space. Axis-aligned portals only — an angled quad
+    /// would need rotated boxes the voxel solver cannot express. Remote
+    /// destinations likewise can't yet (their blocks live in remote worlds).
+    pub(super) fn portal_collision_boxes(&self, bounds: Aabb) -> Vec<Aabb> {
+        let dim = self.dim.id();
+        let mut out: Vec<Aabb> = Vec::new();
+        for p in &self.imm_portals {
+            if p.dim != dim || p.dest_dim != dim {
+                continue;
+            }
+            let axial = |v: Vec3| {
+                [v.x, v.y, v.z]
+                    .into_iter()
+                    .filter(|c| c.abs() > 1e-9)
+                    .count()
+                    == 1
+            };
+            if !(axial(p.w) && axial(p.h) && axial(p.dest_w) && axial(p.dest_h)) {
+                continue;
+            }
+            // Only a box reaching the plane inside the quad's span pulls
+            // the far side in.
+            let (lo, hi) = (
+                Vec3::new(
+                    bounds.min(Axis::X),
+                    bounds.min(Axis::Y),
+                    bounds.min(Axis::Z),
+                ),
+                Vec3::new(
+                    bounds.max(Axis::X),
+                    bounds.max(Axis::Y),
+                    bounds.max(Axis::Z),
+                ),
+            );
+            let mut reaches = false;
+            'corners: for x in [lo.x, hi.x] {
+                for y in [lo.y, hi.y] {
+                    for z in [lo.z, hi.z] {
+                        let c = Vec3::new(x, y, z);
+                        if p.side_distance(c).abs() <= 1.0 && p.inside(c, 1.0) {
+                            reaches = true;
+                            break 'corners;
+                        }
+                    }
+                }
+            }
+            if !reaches {
+                continue;
+            }
+            // The entity box, mapped to the far side, bounds the blocks to
+            // pull back; clamp to the exit quad's span plus a couple of
+            // blocks so the scan stays small.
+            let inv = p.inverse();
+            let (mut dmin, mut dmax) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+            for x in [lo.x, hi.x] {
+                for y in [lo.y, hi.y] {
+                    for z in [lo.z, hi.z] {
+                        let t = p.transform_point(Vec3::new(x, y, z));
+                        for (a, v) in [t.x, t.y, t.z].iter().enumerate() {
+                            dmin[a] = dmin[a].min(*v);
+                            dmax[a] = dmax[a].max(*v);
+                        }
+                    }
+                }
+            }
+            let (db, dd) = inv.bounds();
+            for a in 0..3 {
+                let (bmin, bmax) = ([db.x, db.y, db.z][a], [dd.x, dd.y, dd.z][a]);
+                dmin[a] = dmin[a].clamp(bmin - 2.0, bmax + 2.0);
+                dmax[a] = dmax[a].clamp(bmin - 2.0, bmax + 2.0);
+            }
+            let mut scene = SceneCollisions {
+                world: &self.world,
+                binding: self.collision,
+                subject: None,
+            };
+            let context = CollisionContext::for_entity(
+                CollisionEntity {
+                    identity: EntityIdentity(0),
+                    y: bounds.center().y,
+                    descending: false,
+                    main_hand: Some(CollisionItem::EMPTY),
+                },
+                false,
+            );
+            for y in (dmin[1].floor() as i32)..=(dmax[1].floor() as i32) {
+                for z in (dmin[2].floor() as i32)..=(dmax[2].floor() as i32) {
+                    for x in (dmin[0].floor() as i32)..=(dmax[0].floor() as i32) {
+                        let state = self.world.block(x, y, z);
+                        if self.res.facts().is_air(state) {
+                            continue;
+                        }
+                        let Ok(shape) = self.collision.collision_shape_with_context(
+                            &mut scene,
+                            state,
+                            BlockPos::new(x, y, z),
+                            &context,
+                        ) else {
+                            continue;
+                        };
+                        for b in shape.boxes() {
+                            // Each far-side box comes back through the
+                            // portal into local space as a plain AABB.
+                            let (mut mn, mut mx) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+                            for cx in [b.min(Axis::X), b.max(Axis::X)] {
+                                for cy in [b.min(Axis::Y), b.max(Axis::Y)] {
+                                    for cz in [b.min(Axis::Z), b.max(Axis::Z)] {
+                                        let t = inv.transform_point(Vec3::new(cx, cy, cz));
+                                        for (a, v) in [t.x, t.y, t.z].iter().enumerate() {
+                                            mn[a] = mn[a].min(*v);
+                                            mx[a] = mx[a].max(*v);
+                                        }
+                                    }
+                                }
+                            }
+                            out.push(Aabb::new(
+                                Vec3::new(mn[0], mn[1], mn[2]),
+                                Vec3::new(mx[0], mx[1], mx[2]),
+                            ));
+                            if out.len() >= 512 {
+                                return out;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Lit frames exist wherever a `nether_portal` block is — lit by
