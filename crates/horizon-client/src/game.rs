@@ -1756,7 +1756,66 @@ impl Game<'_> {
         self.clip_ray(origin, view_vector(self.yaw, self.pitch), self.reach())
     }
     /// The first block outline hit within `reach` along the unit `dir`.
+    /// The ray can pass through see-through portals: when it crosses a
+    /// portal plane inside the quad before hitting a block, it continues
+    /// from the far side's transformed position (same dimension only —
+    /// remote worlds' blocks can't be acted on).
     fn clip_ray(&self, origin: [f64; 3], dir: [f64; 3], reach: f64) -> Option<Hit> {
+        let mut hops = 0;
+        let (mut origin, mut dir, mut reach) = (origin, dir, reach);
+        loop {
+            // The nearest portal the ray crosses before its end.
+            let o = Vec3::new(origin[0], origin[1], origin[2]);
+            let d = Vec3::new(dir[0], dir[1], dir[2]);
+            let mut first_cross: Option<(f64, &horizon_client::portals::Portal)> = None;
+            for p in &self.imm_portals {
+                if p.dim != self.dim.id() || p.dest_dim != p.dim {
+                    continue;
+                }
+                if p.side_distance(o) <= 0.0 {
+                    continue;
+                }
+                let Some(q) = p.quad() else { continue };
+                let n = q.normal;
+                let denom = n.x * d.x + n.y * d.y + n.z * d.z;
+                if denom >= -1e-9 {
+                    continue;
+                }
+                let t = (n.x * (p.center.x - o.x)
+                    + n.y * (p.center.y - o.y)
+                    + n.z * (p.center.z - o.z))
+                    / denom;
+                if t <= 0.0 || t >= reach || !p.inside(o.add_vector(d.scale(t)), 0.0) {
+                    continue;
+                }
+                if first_cross.is_none_or(|(bt, _)| t < bt) {
+                    first_cross = Some((t, p));
+                }
+            }
+            // The march runs only as far as the first portal crossing; a
+            // block hit before it wins.
+            let stop = first_cross.map_or(reach, |(t, _)| t);
+            match self.clip_ray_until(origin, dir, stop) {
+                Some(hit) => return Some(hit),
+                None => {}
+            }
+            let Some((t, p)) = first_cross else {
+                return None;
+            };
+            hops += 1;
+            if hops > 4 {
+                return None;
+            }
+            let cross = o.add_vector(d.scale(t));
+            let after = p.transform_point(cross);
+            let td = p.transform_dir(d);
+            origin = [after.x, after.y, after.z];
+            dir = [td.x, td.y, td.z];
+            reach -= t;
+        }
+    }
+    /// The DDA march over `reach` (split out so portals can re-enter it).
+    fn clip_ray_until(&self, origin: [f64; 3], dir: [f64; 3], reach: f64) -> Option<Hit> {
         let mut pos = origin.map(|v| v.floor() as i32);
         let step = dir.map(|d| if d > 0.0 { 1 } else { -1 });
         let delta = dir.map(|d| {
