@@ -895,6 +895,8 @@ impl Game<'_> {
         self.set_mode_id(spawn.game_type);
         self.dim = Dim::from_id(&spawn.dimension);
         if !same {
+            // The new dimension's portals arrive via `horizon:portals`.
+            self.imm_portals.clear();
             let mut streaming = Streaming::new(
                 Arc::new(NoTerrain),
                 self.pack.context.clone(),
@@ -1626,6 +1628,15 @@ impl Game<'_> {
                     r.health = (20.0, 20, 5.0);
                 }
                 self.capture(true);
+            }
+            // Horizon channels (`horizon_client::portals`): the level's
+            // see-through portals, pushed by the server.
+            C::CustomPayload(p)
+                if p.channel == horizon_client::portals::CHANNEL =>
+            {
+                if let Some(list) = horizon_client::portals::decode(&p.data) {
+                    self.set_remote_portals(list);
+                }
             }
             C::PlayerPosition(p) => self.remote_teleport(&p)?,
             C::PlayerRotation(p) => {

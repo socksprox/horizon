@@ -602,6 +602,31 @@ fn horizon_commands(d: &mut Dispatcher, root: usize) {
         let w = d.literal(pregen, word);
         d.executes(w, id);
     }
+    // `/portal` (Horizon's see-through portals, `game/portals.rs`):
+    // `spawn` a linked pair ahead of you, `mirror` a wall that reflects,
+    // `list`, `remove` nearest or by id, `remove all`.
+    let portal = d.literal(root, "portal");
+    d.requires(portal, GAMEMASTERS);
+    for (word, id) in [
+        ("spawn", "portal.spawn"),
+        ("mirror", "portal.mirror"),
+        ("floor", "portal.floor"),
+        ("list", "portal.list"),
+    ] {
+        let w = d.literal(portal, word);
+        d.executes(w, id);
+    }
+    let remove = d.literal(portal, "remove");
+    d.executes(remove, "portal.remove");
+    let remove_id = d.argument(
+        remove,
+        "id",
+        ArgType::Integer {
+            min: 0,
+            max: i32::MAX,
+        },
+    );
+    d.executes(remove_id, "portal.remove");
 }
 pub fn dispatcher() -> &'static Dispatcher {
     static TREE: std::sync::OnceLock<Dispatcher> = std::sync::OnceLock::new();

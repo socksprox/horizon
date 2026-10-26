@@ -196,6 +196,7 @@ impl Game<'_> {
         swap(&mut self.orbs, &mut p.orbs);
         swap(&mut self.persist, &mut p.persist);
         swap(&mut self.imm_portals, &mut p.imm_portals);
+        self.portal_sync_dirty = true;
         swap(&mut self.lectern_pulses, &mut p.lectern_pulses);
         swap(&mut self.lid_openers, &mut p.lid_openers);
         swap(&mut self.lan_events, &mut p.lan_events);

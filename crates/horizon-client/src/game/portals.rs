@@ -5,10 +5,15 @@
 //! The list lives in the level (`game/levels.rs` parks it with the world):
 //! servers mutate it and push it to guests, remote clients only read it.
 
-use super::{Dim, Game};
+use super::{Dim, Game, commands::R};
+use horizon_client::command::{
+    args::Arg,
+    Context,
+};
 use horizon_client::{
     gfx::{self, portal::View},
     portals::{self, Portal},
+    text::Text,
 };
 use horizon_core::geometry::Vec3;
 use horizon_protocol::packets::{configuration as cfg, play};
@@ -46,6 +51,22 @@ impl Game<'_> {
     /// every guest and the owner, and keep ids unique per level.
     pub(super) fn portals_changed(&mut self) {
         self.portal_sync_dirty = true;
+    }
+    /// Push the level's portal list to every placed guest when it changed
+    /// (`tick_world`); clients filter it to their own dimension.
+    pub(super) fn sync_portals(&mut self) {
+        if !self.portal_sync_dirty {
+            return;
+        }
+        let packet = self.portals_packet();
+        if let Some(host) = &self.lan {
+            for g in &host.hub.guests {
+                if g.placed {
+                    g.send(&packet);
+                }
+            }
+        }
+        self.portal_sync_dirty = false;
     }
     /// The encoded full list for a client (`horizon:portals`); a per-level
     /// snapshot, sent whole on every change (portals are few).
@@ -175,6 +196,11 @@ impl Game<'_> {
                 clip,
             );
             let world = self.portal_world_index(&p.dest_dim);
+            if world == usize::MAX {
+                // Cross-dimension view before `remote_worlds` streams the
+                // far side: draw nothing rather than the wrong world.
+                continue;
+            }
             views.push(View {
                 corners,
                 camera: glam::DVec3::new(dcam.x, dcam.y, dcam.z),
@@ -202,6 +228,100 @@ impl Game<'_> {
         }
     }
 
+    /// `/portal spawn|mirror|floor|list|remove [id]` (command/vanilla.rs).
+    /// Spawning puts the portal ahead of the player, facing them; pairs
+    /// link both ways so either face is an entrance.
+    pub(super) fn cmd_portal(&mut self, id: &str, ctx: &Context) -> R<i32> {
+        match id {
+            "portal.list" => {
+                let mut lines = Vec::new();
+                if self.imm_portals.is_empty() {
+                    lines.push("No portals.".to_owned());
+                }
+                for p in &self.imm_portals {
+                    let (c, d) = (p.center, p.dest_center);
+                    lines.push(format!(
+                        "#{} {} ({:.1} {:.1} {:.1}) -> {} ({:.1} {:.1} {:.1})",
+                        p.id, p.dim, c.x, c.y, c.z, p.dest_dim, d.x, d.y, d.z
+                    ));
+                }
+                let count = self.imm_portals.len() as i32;
+                for line in lines {
+                    self.feedback(Text::literal(line));
+                }
+                Ok(count)
+            }
+            "portal.remove" => {
+                let before = self.imm_portals.len();
+                if let Some(Arg::Int(want)) = ctx.get("id") {
+                    self.imm_portals.retain(|p| p.id != *want as u32);
+                } else if let Some(player) = &self.player {
+                    // Nearest portal within 4 blocks of the player's feet.
+                    let feet = player.position;
+                    let near = self
+                        .imm_portals
+                        .iter()
+                        .filter(|p| p.dim == self.dim.id())
+                        .map(|p| {
+                            let (lo, hi) = p.bounds();
+                            let c = (lo.add_vector(hi.subtract(lo))).scale(0.5);
+                            (p.id, feet.distance_squared(c))
+                        })
+                        .filter(|(_, d)| *d < 16.0)
+                        .min_by_key(|(_, d)| d.to_bits())
+                        .map(|(id, _)| id);
+                    if let Some(id) = near {
+                        self.imm_portals.retain(|p| p.id != id);
+                    }
+                }
+                let removed = before - self.imm_portals.len();
+                if removed > 0 {
+                    self.portals_changed();
+                }
+                self.feedback(Text::literal(format!("Removed {removed} portal(s).")));
+                Ok(removed as i32)
+            }
+            _ => {
+                let Some(player) = &self.player else {
+                    self.feedback(Text::literal("No player."));
+                    return Ok(0);
+                };
+                let feet = player.position;
+                let yaw = self.yaw;
+                let dim = self.dim.id().to_owned();
+                let mut next = self
+                    .imm_portals
+                    .iter()
+                    .map(|p| p.id)
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                let spawned = match id {
+                    "portal.spawn" => {
+                        let (a, b) = portal_pair(feet, yaw, &dim, &mut next);
+                        self.imm_portals.extend([a, b]);
+                        2
+                    }
+                    "portal.mirror" => {
+                        self.imm_portals.push(mirror_portal(feet, yaw, &dim, next));
+                        1
+                    }
+                    "portal.floor" => {
+                        let (a, b) = floor_pair(feet, yaw, &dim, &mut next);
+                        self.imm_portals.extend([a, b]);
+                        2
+                    }
+                    _ => 0,
+                };
+                if spawned > 0 {
+                    self.portals_changed();
+                    self.feedback(Text::literal(format!("Spawned {spawned} portal(s).")));
+                }
+                Ok(spawned)
+            }
+        }
+    }
+
     /// Frustum test for a quad's camera-relative corners under `view_proj`:
     /// false only when every corner is outside the same clip side.
     fn quad_in_frustum(corners: &[[f32; 3]; 4], view_proj: glam::Mat4) -> bool {
@@ -217,4 +337,87 @@ impl Game<'_> {
         }
         !out.iter().all(|&b| b)
     }
+}
+
+/// Horizontal unit forward and right for `yaw` (Minecraft's: yaw 0 south).
+fn yaw_frame(yaw: f32) -> (Vec3, Vec3) {
+    let y = f64::from(yaw).to_radians();
+    (
+        Vec3::new(-y.sin(), 0.0, y.cos()),
+        Vec3::new(-y.cos(), 0.0, -y.sin()),
+    )
+}
+/// `/portal spawn`: two 2x3 verticals 16 apart, linked both ways.
+fn portal_pair(feet: Vec3, yaw: f32, dim: &str, next: &mut u32) -> (Portal, Portal) {
+    let (fwd, right) = yaw_frame(yaw);
+    let up = Vec3::new(0.0, 1.5, 0.0);
+    let a = Portal {
+        id: 0,
+        dim: dim.to_owned(),
+        dest_dim: dim.to_owned(),
+        // Facing the player, two blocks ahead: its normal points at them.
+        center: feet.add_vector(fwd.scale(2.0)).add_vector(up),
+        w: right.scale(2.0),
+        h: Vec3::new(0.0, 3.0, 0.0),
+        dest_center: Vec3::ZERO,
+        dest_w: Vec3::ZERO,
+        dest_h: Vec3::ZERO,
+        mirror: false,
+    };
+    let b = Portal {
+        center: a.center.add_vector(fwd.scale(16.0)),
+        w: a.w.scale(-1.0),
+        ..a.clone()
+    };
+    portals::pair(a, b, next)
+}
+/// `/portal mirror`: the quad's destination is itself, so walking in puts
+/// you back out the same face and the view reflects the world behind you.
+fn mirror_portal(feet: Vec3, yaw: f32, dim: &str, id: u32) -> Portal {
+    let (fwd, right) = yaw_frame(yaw);
+    let up = Vec3::new(0.0, 1.5, 0.0);
+    let center = feet.add_vector(fwd.scale(2.0)).add_vector(up);
+    Portal {
+        id,
+        dim: dim.to_owned(),
+        dest_dim: dim.to_owned(),
+        center,
+        w: right.scale(2.0),
+        h: Vec3::new(0.0, 3.0, 0.0),
+        dest_center: center,
+        dest_w: right.scale(2.0),
+        dest_h: Vec3::new(0.0, 3.0, 0.0),
+        // Same basis on both sides: the transform reduces to reflecting
+        // through the portal's own plane — a mirror, not a flip.
+        mirror: false,
+    }
+}
+/// `/portal floor`: a 2x2 opening in the ground ahead; falling in drops
+/// you out of a matching opening 15 up, 16 ahead (and back up through it).
+fn floor_pair(feet: Vec3, yaw: f32, dim: &str, next: &mut u32) -> (Portal, Portal) {
+    let (fwd, right) = yaw_frame(yaw);
+    let a = Portal {
+        id: 0,
+        dim: dim.to_owned(),
+        dest_dim: dim.to_owned(),
+        center: feet.add_vector(fwd.scale(2.0)),
+        // Flat: `w x h` = right x forward = +y, the face you fall into.
+        w: right.scale(2.0),
+        h: fwd.scale(2.0),
+        dest_center: Vec3::ZERO,
+        dest_w: Vec3::ZERO,
+        dest_h: Vec3::ZERO,
+        mirror: false,
+    };
+    let b = Portal {
+        center: a
+            .center
+            .add_vector(fwd.scale(16.0))
+            .add_vector(Vec3::new(0.0, 15.0, 0.0)),
+        // Swapped axes make `w x h` face down: you fall out its underside.
+        w: a.h,
+        h: a.w,
+        ..a.clone()
+    };
+    portals::pair(a, b, next)
 }
