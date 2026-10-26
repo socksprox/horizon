@@ -118,10 +118,26 @@ impl Levels {
     pub(super) fn parked_portals(&self) -> impl Iterator<Item = &horizon_client::portals::Portal> {
         self.parked.values().flat_map(|p| p.imm_portals.iter())
     }
+    /// Aim a parked level's streamer at a chunk column — a portal's exit
+    /// streams its surroundings to the other side's viewers.
+    pub(super) fn parked_center(&mut self, dim: Dim, center: (i32, i32)) {
+        if let Some(p) = self.parked.get_mut(&dim) {
+            p.streaming.center = center;
+        }
+    }
 }
 
 impl Game<'_> {
     /// A new level for `dim`, opened from the save (`MinecraftServer.createLevels`).
+    /// Open `dim` parked when it isn't already (a portal's exit streams
+    /// out of it even with nobody there).
+    pub(super) fn ensure_level(&mut self, dim: Dim) -> Result<()> {
+        if self.dim != dim && !self.levels.parked.contains_key(&dim) {
+            let p = self.open_level(dim)?;
+            self.levels.parked.insert(dim, p);
+        }
+        Ok(())
+    }
     fn open_level(&self, dim: Dim) -> Result<Parked> {
         let (streaming, save) =
             self.make_streaming(&self.world_root.clone(), dim, self.level.seed)?;
@@ -401,10 +417,20 @@ impl Game<'_> {
             .lan
             .as_ref()
             .map_or(&[][..], |h| h.hub.guests.as_slice());
+        let active = self.dim.id();
         let mut dims: Vec<Dim> = [Dim::Overworld, Dim::Nether, Dim::End]
             .into_iter()
             .filter(|d| {
-                guests.iter().any(|g| g.dimension == d.id()) || self.pregen_level() == Some(*d)
+                guests.iter().any(|g| g.dimension == d.id())
+                    || self.pregen_level() == Some(*d)
+                    // A portal's exit level ticks so its chunks exist to
+                    // stream through to viewers on the near side — the
+                    // portal can sit in a parked level, not only this one.
+                    || self
+                        .imm_portals
+                        .iter()
+                        .chain(self.levels.parked_portals())
+                        .any(|p| p.dest_dim == d.id())
             })
             .collect();
         if dims.is_empty() {

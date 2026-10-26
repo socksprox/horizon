@@ -56,6 +56,9 @@ impl Game<'_> {
             return;
         }
         let changed = self.portal_sync_dirty;
+        // Only this level's guests: a level ticked for another portal's
+        // far side must never clobber a viewer's list with its own.
+        let dim = self.dim.id().to_owned();
         let conns: Vec<u32> = self
             .lan
             .as_ref()
@@ -63,13 +66,13 @@ impl Game<'_> {
                 h.hub
                     .guests
                     .iter()
-                    .filter(|g| g.placed)
+                    .filter(|g| g.placed && g.dimension == dim)
                     .map(|g| g.conn)
                     .collect()
             })
             .unwrap_or_default();
         for conn in conns {
-            if !changed && self.portal_synced.contains(&conn) {
+            if !changed && self.portal_synced.get(&conn) == Some(&dim) {
                 continue;
             }
             let packet = self.portals_packet();
@@ -80,7 +83,7 @@ impl Game<'_> {
             {
                 g.send(&packet);
             }
-            self.portal_synced.insert(conn);
+            self.portal_synced.insert(conn, dim.clone());
         }
         self.portal_sync_dirty = false;
     }
@@ -385,9 +388,17 @@ impl Game<'_> {
                     + 1;
                 let spawned = match id {
                     "portal.spawn" => {
-                        let (a, b) = portal_pair(feet, yaw, &dim, &mut next);
-                        self.imm_portals.extend([a, b]);
-                        2
+                        if let Some(Arg::Resource(dest)) = ctx.get("dimension") {
+                            // One-way into another dimension: this face
+                            // only; `portal_to` keeps `pair`'s geometry.
+                            self.imm_portals
+                                .push(portal_to(feet, yaw, &dim, dest, next));
+                            1
+                        } else {
+                            let (a, b) = portal_pair(feet, yaw, &dim, &mut next);
+                            self.imm_portals.extend([a, b]);
+                            2
+                        }
                     }
                     "portal.mirror" => {
                         self.imm_portals.push(mirror_portal(feet, yaw, &dim, next));
@@ -505,6 +516,25 @@ fn portal_pair(feet: Vec3, yaw: f32, dim: &str, next: &mut u32) -> (Portal, Port
         ..a.clone()
     };
     portals::pair(a, b, next)
+}
+/// `/portal spawn <dimension>`: `portal_pair`'s near face, one-way — the
+/// far side is the same spot, in the named dimension instead.
+fn portal_to(feet: Vec3, yaw: f32, dim: &str, dest: &str, id: u32) -> Portal {
+    let (fwd, right) = yaw_frame(yaw);
+    let up = Vec3::new(0.0, 1.5, 0.0);
+    let center = feet.add_vector(fwd.scale(2.0)).add_vector(up);
+    Portal {
+        id,
+        dim: dim.to_owned(),
+        dest_dim: dest.to_owned(),
+        center,
+        w: right.scale(2.0),
+        h: Vec3::new(0.0, 3.0, 0.0),
+        dest_center: center,
+        dest_w: right.scale(2.0),
+        dest_h: Vec3::new(0.0, 3.0, 0.0),
+        mirror: false,
+    }
 }
 /// `/portal mirror`: the quad's destination is itself, so walking in puts
 /// you back out the same face and the view reflects the world behind you.

@@ -179,6 +179,13 @@ impl Game<'_> {
         if want.is_empty() {
             return;
         }
+        // Exits stay open (`levels_to_tick` keeps them alive and
+        // `update_dedicated_streaming` aims their streamer at the exit).
+        for &(dim, _, _) in &want {
+            if let Err(e) = self.ensure_level(dim) {
+                log::warn!("Horizon: portal exit {dim:?}: {e}");
+            }
+        }
         let mut sent = SENDS_PER_TICK;
         for (dim, cx, cz) in want {
             let Some(world) = self.levels.parked_world(dim) else {
@@ -202,7 +209,8 @@ impl Game<'_> {
                 if sent == 0 {
                     break;
                 }
-                if !g.placed {
+                // Only viewers on the portal's side stream its far level.
+                if !g.placed || g.dimension != active {
                     continue;
                 }
                 let seen = self.remote_sent.entry(g.conn).or_default();
@@ -217,8 +225,10 @@ impl Game<'_> {
                     let Some(chunk) = world.chunks.get(&(x, z)) else {
                         continue;
                     };
-                    let body = host.hub.encoder.body_in(chunk, world);
-                    let data = portals::encode_remote_chunk_body(&dim_name, &dim_name, body);
+                    let packet =
+                        host.hub.encoder.encode(chunk, &world.block_entities);
+                    let data =
+                        portals::encode_remote_chunk(&dim_name, &dim_name, &packet);
                     g.send(&play::Clientbound::CustomPayload(cfg::CustomPayload {
                         channel: portals::REMOTE_CHUNK_CHANNEL.into(),
                         data,

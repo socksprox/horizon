@@ -616,6 +616,12 @@ fn horizon_commands(d: &mut Dispatcher, root: usize) {
         let w = d.literal(portal, word);
         d.executes(w, id);
     }
+    // `spawn <dimension>`: a one-way portal ahead of you into that
+    // dimension (the pair's far side stays where a same-dimension pair
+    // would put it).
+    let spawn_dim = d.literal(portal, "spawn");
+    let spawn_dim_arg = d.argument(spawn_dim, "dimension", ArgType::Dimension);
+    d.executes(spawn_dim_arg, "portal.spawn");
     let remove = d.literal(portal, "remove");
     d.executes(remove, "portal.remove");
     let remove_id = d.argument(

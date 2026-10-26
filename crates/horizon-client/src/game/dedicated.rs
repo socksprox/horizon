@@ -731,6 +731,7 @@ impl Game<'_> {
     /// The chunks to keep loaded: the players' (lan_update_streaming), or
     /// the spawn chunk while nobody is online.
     pub(super) fn update_dedicated_streaming(&mut self) {
+        let dim = self.dim.id();
         let center = self
             .lan
             .as_ref()
@@ -740,6 +741,20 @@ impl Game<'_> {
                     .iter()
                     .find(|g| h.hub.here(g))
                     .map(|g| g.chunk())
+            })
+            .or_else(|| {
+                // Nobody here but a portal looks in: generate around its
+                // exit so the other side's remote world has content.
+                self.imm_portals
+                    .iter()
+                    .chain(self.levels.parked_portals())
+                    .find(|p| p.dest_dim == dim && p.dim != dim)
+                    .map(|p| {
+                        (
+                            (p.dest_center.x.floor() as i32) >> 4,
+                            (p.dest_center.z.floor() as i32) >> 4,
+                        )
+                    })
             })
             .or_else(|| {
                 self.spawn

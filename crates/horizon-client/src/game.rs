@@ -1528,9 +1528,9 @@ struct Game<'a> {
     remote_worlds: Vec<remote_worlds::RemoteDim>,
     /// Server side: the remote-world columns each guest already has.
     remote_sent: HashMap<u32, HashSet<(String, i32, i32)>>,
-    /// Guests that have the current portal list (`sync_portals` fills it
-    /// as they join).
-    portal_synced: HashSet<u32>,
+    /// Guests that have a portal list, and for which dimension
+    /// (`sync_portals` fills it as they join and move).
+    portal_synced: HashMap<u32, String>,
     /// Connected to a server: the world comes from the network (game/remote.rs).
     remote: Option<remote::Remote>,
     /// This world is open to the network (game/lan.rs).
@@ -12195,7 +12195,7 @@ impl<'a> Game<'a> {
             portal_travel_request: None,
             remote_worlds: Vec::new(),
             remote_sent: HashMap::new(),
-            portal_synced: HashSet::new(),
+            portal_synced: HashMap::new(),
             lan_global_events: Vec::new(),
             lid_openers: HashMap::new(),
             lan_acting: None,
