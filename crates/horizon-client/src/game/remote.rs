@@ -3031,6 +3031,7 @@ impl Game<'_> {
 
     fn tick_remote_level(&mut self) -> Result<()> {
         self.ticks += 1;
+        self.apply_portal_travel();
         self.track_experience_display();
         // Options.broadcastOptions: a changed render distance is sent again.
         let view = client_view_distance(self.settings.render_distance);
@@ -3172,6 +3173,32 @@ impl Game<'_> {
                 resources: self.motion,
             }
             .controlled_simulation_tick(keys)?;
+            // See-through portals: crossing one's quad moves through it.
+            if self.portal_cooldown > 0 {
+                self.portal_cooldown -= 1;
+            } else {
+                let from = self
+                    .previous_position
+                    .add_vector(Vec3::new(0.0, super::portals::CROSS_HEIGHT, 0.0));
+                let to = player
+                    .position
+                    .add_vector(Vec3::new(0.0, super::portals::CROSS_HEIGHT, 0.0));
+                let dim = self.dim.id();
+                if let Some(p) =
+                    Self::crossed_in(&self.imm_portals, dim, from, to).cloned()
+                {
+                    if p.dest_dim == dim {
+                        player.position = p.transform_point(player.position);
+                        player.velocity = p.transform_dir(player.velocity);
+                        let (yaw, pitch) = p.transform_yaw_pitch(self.yaw, self.pitch);
+                        self.yaw = yaw;
+                        self.pitch = pitch;
+                    } else {
+                        self.portal_travel_request = Some(p.id);
+                    }
+                    self.portal_cooldown = super::portals::CROSS_COOLDOWN;
+                }
+            }
         }
         // LocalPlayer.onUpdateAbilities: flight turned on or off (a double
         // jump, a spectator, landing) is sent to the server.

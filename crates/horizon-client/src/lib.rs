@@ -145,6 +145,7 @@ pub mod pick_item;
 pub mod player_sync;
 pub mod poi_sections;
 pub mod portal_sections;
+pub mod portals;
 pub mod pose;
 pub mod pregen;
 pub mod projectiles;

@@ -110,6 +110,10 @@ pub struct Extras {
     pub sort_key: String,
     /// No AI: every AI feature hidden and off (`horizon_core::no_ai`; the launcher writes it too).
     pub no_ai: bool,
+    /// See-through portals (`horizon_client::portals`): portals a world
+    /// holds show the far side instead of nothing. On by default: portals
+    /// only exist where a world placed them.
+    pub portals: bool,
     /// Agents may control the game the player starts: it opens its control socket for
     /// horizon-ctl and MCP clients (off by default; an agent's own launch always opens it).
     pub agent_control: bool,
@@ -144,6 +148,7 @@ impl Default for Extras {
             sort: false,
             sort_key: "key.keyboard.unknown".into(),
             no_ai: false,
+            portals: true,
             agent_control: false,
             discord_presence: true,
         }
@@ -210,6 +215,7 @@ impl Extras {
                 "sort" => e.sort = flag(e.sort),
                 "sortKey" if value.starts_with("key.") => e.sort_key = value.to_owned(),
                 horizon_core::no_ai::KEY => e.no_ai = flag(e.no_ai),
+                "portals" => e.portals = flag(e.portals),
                 "agentControl" => e.agent_control = flag(e.agent_control),
                 "discordPresence" => e.discord_presence = flag(e.discord_presence),
                 _ => {}
@@ -219,7 +225,7 @@ impl Extras {
     }
     pub fn serialize(&self) -> String {
         format!(
-            "fullbright:{}\ndynamicLights:{}\nzoom:{}\nzoomKey:{}\nzoomLevel:{}\nzoomSmooth:{}\nzoomSensitivity:{}\nfps:{}\nfpsCorner:{}\nfpsLows:{}\nkeystrokes:{}\nkeystrokesCorner:{}\nkeystrokesCps:{}\nminimap:{}\nminimapCorner:{}\nminimapSize:{}\nminimapShape:{}\nminimapZoom:{}\nminimapRotate:{}\nautoReconnect:{}\nmouseTweaks:{}\nmouseTweaksWheel:{}\nsort:{}\nsortKey:{}\n{}:{}\nagentControl:{}\ndiscordPresence:{}\n",
+            "fullbright:{}\ndynamicLights:{}\nzoom:{}\nzoomKey:{}\nzoomLevel:{}\nzoomSmooth:{}\nzoomSensitivity:{}\nfps:{}\nfpsCorner:{}\nfpsLows:{}\nkeystrokes:{}\nkeystrokesCorner:{}\nkeystrokesCps:{}\nminimap:{}\nminimapCorner:{}\nminimapSize:{}\nminimapShape:{}\nminimapZoom:{}\nminimapRotate:{}\nautoReconnect:{}\nmouseTweaks:{}\nmouseTweaksWheel:{}\nsort:{}\nsortKey:{}\n{}:{}\nportals:{}\nagentControl:{}\ndiscordPresence:{}\n",
             bool_text(self.fullbright),
             bool_text(self.dynamic_lights),
             bool_text(self.zoom),
@@ -250,6 +256,7 @@ impl Extras {
             self.sort_key,
             horizon_core::no_ai::KEY,
             bool_text(self.no_ai),
+            bool_text(self.portals),
             bool_text(self.agent_control),
             bool_text(self.discord_presence),
         )

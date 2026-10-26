@@ -73,6 +73,7 @@ mod pack_post;
 pub mod pack_uniforms;
 mod page_runs;
 pub mod panorama;
+pub mod portal;
 mod resident;
 mod stars;
 mod timing;
@@ -233,6 +234,10 @@ pub struct Frame<'a> {
     /// Camera-relative entity geometry textured from the shared atlas.
     pub entities: &'a [Vertex],
     pub weather: &'a [crate::weather::Vertex],
+    /// See-through portals (`gfx/portal.rs`): each entry's world renders
+    /// into its offscreen target before the world pass, and the quad
+    /// samples it where it lands on screen. Empty on every vanilla frame.
+    pub portal_views: &'a [portal::View<'a>],
     pub weather_time: crate::weather::Time,
     /// Horizon Extras' dynamic lights, nearest first (`dynamic_light::select`); empty when off.
     pub dynamic_lights: &'a [[f32; 4]],
@@ -491,6 +496,24 @@ pub struct Renderer {
     pub screenshot: Option<PathBuf>,
     /// Outcome of the last screenshot: frame size, or the error.
     pub screenshot_result: Option<std::result::Result<[u32; 2], String>>,
+    /// See-through portals (`gfx/portal.rs`): the offscreen targets the far
+    /// side of each visible portal renders into, its pipelines and draw
+    /// scratch, and the sprite views its world bind groups share.
+    portal_targets: Vec<portal::Target>,
+    portal_quad_layout: wgpu::BindGroupLayout,
+    portal_quad: wgpu::RenderPipeline,
+    portal_quads: wgpu::Buffer,
+    portal_instances: wgpu::Buffer,
+    portal_instance_capacity: u64,
+    portal_draws: Vec<[u32; 5]>,
+    portal_pages: Vec<(u32, Option<u32>)>,
+    portal_origins: Vec<[f32; 4]>,
+    portal_entities: wgpu::Buffer,
+    portal_entity_capacity: u64,
+    portal_sprite_views: Vec<wgpu::TextureView>,
+    /// Resident sections of remote worlds `remote` streams for portals
+    /// (`portal::View::world` = index + 1).
+    portal_worlds: Vec<resident::Resident<SectionGpu>>,
     /// Brightness option (lightmap gamma), 0..1.
     pub gamma: f32,
     /// Optional full-light lightmap (Horizon Extras).
@@ -2202,6 +2225,104 @@ impl Renderer {
             },
             mapped_at_creation: false,
         });
+        // See-through portals (gfx/portal.rs): the quad that samples a
+        // portal view's texture, its bind layout (main globals + texture +
+        // sampler), and the buffers the per-view world passes stage into.
+        let portal_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Portal"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("portal.wgsl").into()),
+        });
+        let portal_quad_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Portal quad bindings"),
+                entries: &[
+                    entry(
+                        0,
+                        vf,
+                        wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                    ),
+                    entry(
+                        1,
+                        vf,
+                        wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                    ),
+                    entry(
+                        2,
+                        vf,
+                        wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    ),
+                ],
+            });
+        let portal_quad_layout_for_pipeline =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Portal quad layout"),
+                bind_group_layouts: &[Some(&portal_quad_layout)],
+                ..Default::default()
+            });
+        let portal_quad = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Portal quad"),
+            layout: Some(&portal_quad_layout_for_pipeline),
+            vertex: wgpu::VertexState {
+                module: &portal_shader,
+                entry_point: Some("vs_portal"),
+                compilation_options: Default::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: 12,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+                })],
+            },
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &portal_shader,
+                entry_point: Some("fs_portal"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format.remove_srgb_suffix(),
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let portal_quads = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Portal quads"),
+            size: (portal::MAX_VIEWS * 4 * 12) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let portal_instances = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Portal section origins"),
+            size: 16,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let portal_entities = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Portal entity vertices"),
+            size: 64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         // HORIZON_GPU_CULL=0 turns occlusion culling off, `all` culls every
         // frame however few its draws and little it hides, `shader` tests in
         // the shader as on Metal (A/B checks).
@@ -2359,6 +2480,19 @@ impl Renderer {
             phase2_runs: page_runs::PageRuns::default(),
             block_entities: HashMap::new(),
             block_entity_revision: next_block_entity_revision(),
+            portal_targets: Vec::new(),
+            portal_quad_layout,
+            portal_quad,
+            portal_quads,
+            portal_instances,
+            portal_instance_capacity: 0,
+            portal_draws: Vec::new(),
+            portal_pages: Vec::new(),
+            portal_origins: Vec::new(),
+            portal_entities,
+            portal_entity_capacity: 0,
+            portal_sprite_views: sprite_views.clone(),
+            portal_worlds: Vec::new(),
             occlusion: occlusion::Occlusion::new(crate::chunk::MIN_Y, crate::chunk::HEIGHT / 16),
             world_post,
             pack_post: None,
@@ -2706,6 +2840,40 @@ impl Renderer {
             i += run;
         }
     }
+    /// The resident sections a `portal::View::world` draws: the current
+    /// world (0) or a remote world streamed for a portal (index + 1).
+    fn sections_for(&self, world: usize) -> &resident::Resident<SectionGpu> {
+        world
+            .checked_sub(1)
+            .and_then(|i| self.portal_worlds.get(i))
+            .unwrap_or(&self.sections)
+    }
+    /// `self.portal_worlds[at]` (creating it) plus this world's streaming
+    /// bookkeeping — for `game/remote_worlds.rs`.
+    pub fn portal_world(&mut self, at: usize) -> &mut resident::Resident<SectionGpu> {
+        while self.portal_worlds.len() <= at {
+            self.portal_worlds.push(resident::Resident::default());
+        }
+        &mut self.portal_worlds[at]
+    }
+    /// Drop a remote world's meshes from the arena (its `Resident` too).
+    pub fn clear_portal_world(&mut self, at: usize) {
+        if let Some(world) = self.portal_worlds.get_mut(at) {
+            let slots: Vec<u32> = (0..world.len() as u32).collect();
+            for slot in slots {
+                let s = world.get(slot);
+                let (page, start, translucent, sorted) =
+                    (s.page, s.start, s.translucent, s.sorted_indices);
+                let solid = s.solid;
+                if let Some((p, i)) = sorted {
+                    self.sorted_indices.release(p, i, u64::from(translucent) * 6);
+                }
+                self.arena
+                    .release(page, start, u64::from(solid + translucent) * 4);
+            }
+            world.clear();
+        }
+    }
     fn release_section(&mut self, key: SectionKey) {
         if let Some(s) = self.sections.remove(key) {
             self.release_mesh(s);
@@ -2862,6 +3030,8 @@ impl Renderer {
             &self.lightmap_view,
             &self.lightmap_sampler,
         );
+        self.portal_sprite_views = views;
+        self.rebuild_portal_groups();
     }
     pub fn view_projection(&self, frame: &Frame) -> Mat4 {
         self.projection(
@@ -2870,6 +3040,23 @@ impl Renderer {
             frame.pitch,
             frame.bob,
             frame.depth_far,
+        )
+    }
+    /// A `portal::View::view_proj`: the world's projection for the view's
+    /// own look direction, near-clipped at the destination quad's plane
+    /// (`portal.rs`).
+    pub fn portal_view_projection(
+        &self,
+        fov_degrees: f32,
+        yaw: f32,
+        pitch: f32,
+        bob: Mat4,
+        depth_far: f32,
+        clip_plane: Vec4,
+    ) -> Mat4 {
+        portal::oblique(
+            self.projection(fov_degrees, yaw, pitch, bob, depth_far),
+            clip_plane,
         )
     }
     /// The view frustum `render` will cull with, for culling geometry built
@@ -2887,8 +3074,12 @@ impl Renderer {
         }
     }
     fn projection(&self, fov_degrees: f32, yaw: f32, pitch: f32, bob: Mat4, far: f32) -> Mat4 {
-        let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
-        world_projection(fov_degrees, aspect, far) * bob * crate::camera::view_matrix(yaw, pitch)
+        world_view_projection(self.aspect(), fov_degrees, yaw, pitch, bob, far)
+    }
+    /// Width over height of the render target, for callers building their
+    /// own projections (`portal_views`).
+    pub fn aspect(&self) -> f32 {
+        self.config.width as f32 / self.config.height.max(1) as f32
     }
     fn update_lightmap(
         &mut self,
@@ -3704,6 +3895,33 @@ impl Renderer {
                 bytemuck::cast_slice(&self.draws),
             );
         }
+        // See-through portals (gfx/portal.rs): each view's far side renders
+        // into its offscreen target first; the quads draw in the world pass.
+        let portal_views = frame.portal_views.len().min(portal::MAX_VIEWS);
+        let portal_views = self.portal_targets(portal_views).min(portal_views);
+        let mut portal_vis = std::mem::take(&mut self.visible);
+        for (i, view) in frame.portal_views[..portal_views].iter().enumerate() {
+            portal_vis.clear();
+            self.sections_for(view.world).visible(
+                view.camera,
+                (frame.detail_distance / 16.0) as i32,
+                &Frustum {
+                    planes: frustum(view.view_proj),
+                },
+                |_| true,
+                |_, _| false,
+                &mut portal_vis,
+            );
+            self.uploads.buffer(
+                &mut encoder,
+                &self.portal_quads,
+                (i * 4 * 12) as u64,
+                bytemuck::cast_slice(&view.corners),
+            );
+            self.draw_portal_world(&mut encoder, i, view, &globals, &portal_vis);
+        }
+        portal_vis.clear();
+        self.visible = portal_vis;
         let view_target = target_texture.create_view(&wgpu::TextureViewDescriptor {
             format: Some(self.config.format.remove_srgb_suffix()),
             ..Default::default()
@@ -3957,6 +4175,18 @@ impl Renderer {
                         translucent_draws,
                     );
                 }
+            }
+            // See-through portals: each quad samples its offscreen view,
+            // over translucent terrain so water does not cover the opening.
+            for i in 0..portal_views {
+                pass.set_pipeline(&self.portal_quad);
+                pass.set_bind_group(0, &self.portal_targets[i].group, &[]);
+                pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.set_vertex_buffer(0, self.portal_quads.slice(..));
+                pass.draw_indexed(0..6, (i * 4) as i32, 0..1);
+            }
+            if portal_views > 0 {
+                pass.set_bind_group(0, &self.group, &[]);
             }
             // LevelRenderer.executeTranslucentAfterTerrain: vanilla's
             // translucent particle layer draws after translucent terrain —
@@ -4379,6 +4609,19 @@ fn camera_section(camera: DVec3) -> SectionKey {
 
 fn world_projection(fov_degrees: f32, aspect: f32, far: f32) -> Mat4 {
     Mat4::perspective_rh(fov_degrees.to_radians(), aspect, far, 0.05)
+}
+
+/// `world_projection * bob * view`, for code building portal view matrices
+/// without a `Renderer` (`game/portals.rs`).
+pub fn world_view_projection(
+    aspect: f32,
+    fov_degrees: f32,
+    yaw: f32,
+    pitch: f32,
+    bob: Mat4,
+    far: f32,
+) -> Mat4 {
+    world_projection(fov_degrees, aspect, far) * bob * crate::camera::view_matrix(yaw, pitch)
 }
 
 /// Where a perspective `view_proj` sees from, in its own (camera-relative)

@@ -68,6 +68,8 @@ pub(super) struct Parked {
     dropped: Vec<ItemEntity>,
     orbs: Vec<ExperienceOrb>,
     persist: persist::EntityMemory,
+    /// See-through portals of this dimension (`game/portals.rs`).
+    imm_portals: Vec<horizon_client::portals::Portal>,
     lectern_pulses: Vec<((i32, i32, i32), i32)>,
     lid_openers: HashMap<(i32, i32, i32), i32>,
     lan_events: Vec<(i32, [i32; 3], i32, Option<u32>)>,
@@ -145,6 +147,7 @@ impl Game<'_> {
             dropped: Vec::new(),
             orbs: Vec::new(),
             persist: Default::default(),
+            imm_portals: Vec::new(),
             lectern_pulses: Vec::new(),
             lid_openers: HashMap::new(),
             lan_events: Vec::new(),
@@ -192,6 +195,7 @@ impl Game<'_> {
         swap(&mut self.dropped, &mut p.dropped);
         swap(&mut self.orbs, &mut p.orbs);
         swap(&mut self.persist, &mut p.persist);
+        swap(&mut self.imm_portals, &mut p.imm_portals);
         swap(&mut self.lectern_pulses, &mut p.lectern_pulses);
         swap(&mut self.lid_openers, &mut p.lid_openers);
         swap(&mut self.lan_events, &mut p.lan_events);

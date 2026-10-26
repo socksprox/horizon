@@ -120,6 +120,7 @@ mod perspective;
 mod pickups;
 mod piglins;
 mod player_equip;
+mod portals;
 mod postprocess;
 mod potions;
 mod powder_snow;
@@ -1512,6 +1513,18 @@ struct Game<'a> {
     /// The overworld's last `sky_darken` and its inputs (time, rain, thunder).
     sky_darken_memo: std::cell::Cell<Option<((i64, u32, u32), i32)>>,
     persist: persist::EntityMemory,
+    /// See-through portals in the level in place (`game/portals.rs`); on a
+    /// remote client, the synced list the server sent instead.
+    imm_portals: Vec<horizon_client::portals::Portal>,
+    /// Server side: `portals` changed and guests have not heard it yet.
+    portal_sync_dirty: bool,
+    /// Ticks a crossing stays ignored, so a pair does not bounce you back.
+    portal_cooldown: u8,
+    /// A cross-dimension crossing queued inside the player borrow
+    /// (`apply_portal_travel` runs it).
+    portal_travel_request: Option<u32>,
+    /// Remote dimensions a portal's view streams (`game/remote_worlds.rs`).
+    remote_worlds: Vec<portals::RemoteDim>,
     /// Connected to a server: the world comes from the network (game/remote.rs).
     remote: Option<remote::Remote>,
     /// This world is open to the network (game/lan.rs).
@@ -4219,6 +4232,32 @@ impl Game<'_> {
             if grounded && keys.jump && !player.flying && player.velocity.y > 0.2 {
                 self.stats.custom("jump", 1);
             }
+            // See-through portals: crossing one's quad moves through it.
+            if self.portal_cooldown > 0 {
+                self.portal_cooldown -= 1;
+            } else {
+                let from = self
+                    .previous_position
+                    .add_vector(Vec3::new(0.0, portals::CROSS_HEIGHT, 0.0));
+                let to = player
+                    .position
+                    .add_vector(Vec3::new(0.0, portals::CROSS_HEIGHT, 0.0));
+                let dim = self.dim.id();
+                if let Some(p) =
+                    Self::crossed_in(&self.imm_portals, dim, from, to).cloned()
+                {
+                    if p.dest_dim == dim {
+                        player.position = p.transform_point(player.position);
+                        player.velocity = p.transform_dir(player.velocity);
+                        let (yaw, pitch) = p.transform_yaw_pitch(self.yaw, self.pitch);
+                        self.yaw = yaw;
+                        self.pitch = pitch;
+                    } else {
+                        self.portal_travel_request = Some(p.id);
+                    }
+                    self.portal_cooldown = portals::CROSS_COOLDOWN;
+                }
+            }
         }
         let events = std::mem::take(&mut player.events);
         let spin_hit = player.spin_hit.take();
@@ -4421,6 +4460,7 @@ impl Game<'_> {
     /// What the tick runs after the local player's own update: effects, the
     /// world's entities and blocks, and the network hub.
     fn tick_world(&mut self, running: bool) -> Result<()> {
+        self.apply_portal_travel();
         self.update_chunk_tickets();
         horizon_client::spans::time("tick_effects", || self.tick_effects(running));
         // Player.tick's ItemCooldowns.tick for the window's player (a
@@ -10212,7 +10252,21 @@ impl Game<'_> {
         } else {
             self.shader_pack_inputs(camera, alpha as f32)
         };
+        let portal_views = if self.settings.extras.portals {
+            self.portal_views(
+                Vec3::new(camera.x, camera.y, camera.z),
+                yaw,
+                pitch,
+                fov_degrees,
+                bob,
+                depth_far,
+                self.renderer.as_ref().map_or(16.0 / 9.0, |r| r.aspect()),
+            )
+        } else {
+            Vec::new()
+        };
         let frame = Frame {
+            portal_views: &portal_views,
             weather: &weather,
             weather_time: horizon_client::weather::Time::new(self.world.game_time, alpha as f32),
             nether_lighting: self.dim == Dim::Nether,
@@ -12124,6 +12178,11 @@ impl<'a> Game<'a> {
             lan_events: Vec::new(),
             lan_block_events: Vec::new(),
             lan_entity_events: Vec::new(),
+            imm_portals: Vec::new(),
+            portal_sync_dirty: false,
+            portal_cooldown: 0,
+            portal_travel_request: None,
+            remote_worlds: Vec::new(),
             lan_global_events: Vec::new(),
             lid_openers: HashMap::new(),
             lan_acting: None,
@@ -12857,6 +12916,7 @@ fn loading_frame(hud: &HudBatch) -> Frame<'_> {
         hud,
         nether_lighting: false,
         entities: &[],
+        portal_views: &[],
         dynamic_lights: &[],
         clouds: None,
         lightning: Default::default(),
