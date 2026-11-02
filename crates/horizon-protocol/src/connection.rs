@@ -11,7 +11,7 @@ use std::{
     net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicI64, Ordering},
+        atomic::{self, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -213,12 +213,20 @@ pub enum Socket {
 }
 
 /// Packets received/sent and bytes in/out, for the debug screen.
+/// 64-bit where the target has 64-bit atomics; narrower debug counters
+/// wrap harmlessly and keep targets without them (armv6k-nintendo-3ds)
+/// compiling.
+#[cfg(target_has_atomic = "64")]
+type AtomicCount = atomic::AtomicI64;
+#[cfg(not(target_has_atomic = "64"))]
+type AtomicCount = atomic::AtomicI32;
+
 #[derive(Debug, Default)]
 pub struct Counters {
-    pub received: AtomicI64,
-    pub sent: AtomicI64,
-    pub bytes_in: AtomicI64,
-    pub bytes_out: AtomicI64,
+    pub received: AtomicCount,
+    pub sent: AtomicCount,
+    pub bytes_in: AtomicCount,
+    pub bytes_out: AtomicCount,
 }
 
 pub struct ConnReader {
@@ -601,7 +609,7 @@ impl ConnReader {
         let n = source.read(&mut self.buffer[self.end..])?;
         self.counters
             .bytes_in
-            .fetch_add(n as i64, Ordering::Relaxed);
+            .fetch_add(n as _, Ordering::Relaxed);
         let data = &mut self.buffer[self.end..self.end + n];
         if let Some(c) = &mut self.decrypt {
             c.decrypt(data);
@@ -673,7 +681,7 @@ impl ConnWriter {
         self.counters.sent.fetch_add(1, Ordering::Relaxed);
         self.counters
             .bytes_out
-            .fetch_add((out.len() - at) as i64, Ordering::Relaxed);
+            .fetch_add((out.len() - at) as _, Ordering::Relaxed);
     }
     pub fn shutdown(&self) {
         self.stream.shutdown();

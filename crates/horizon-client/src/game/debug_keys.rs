@@ -233,9 +233,9 @@ impl Game<'_> {
         let received = r.session.counters.lock().unwrap().as_ref().map(|c| {
             let order = std::sync::atomic::Ordering::Relaxed;
             [
-                c.bytes_in.load(order),
-                c.sent.load(order),
-                c.received.load(order),
+                c.bytes_in.load(order) as i64,
+                c.sent.load(order) as i64,
+                c.received.load(order) as i64,
             ]
         });
         if let Some([bytes, sent, received]) = received {
