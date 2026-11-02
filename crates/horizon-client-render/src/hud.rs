@@ -1030,9 +1030,9 @@ impl HudAtlas {
     /// the full atlas holds does not fit. `sprite_or_missing` finds no
     /// missing sprite here, and `text_shader` stays `None`.
     pub fn build_gui_subset(root: &Path, defaults: &Path, folders: &[&str]) -> Result<Self> {
-        // 2048 a side and 128 glyph rows: menu textures at any GUI scale,
+        // 4096 a side and 128 glyph rows: menu textures at any GUI scale,
         // ~16 MB of pixels at most, against the full atlas's 16384 and 512.
-        const MAX_SIDE: u32 = 2048;
+        const MAX_SIDE: u32 = 4096;
         const GLYPHS: u32 = 128;
         Self::pack_sized(root, defaults, folders, false, false, MAX_SIDE, GLYPHS)
     }
