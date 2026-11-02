@@ -9,9 +9,12 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
+#[cfg(not(target_os = "horizon"))]
 use wgpu::util::DeviceExt;
 
+#[cfg(not(target_os = "horizon"))]
 pub mod cit_glint;
+#[cfg(not(target_os = "horizon"))]
 mod pack_text;
 
 /// A sprite's atlas region, and its size in GUI pixels: the size of the
@@ -843,15 +846,21 @@ impl HudAtlas {
     /// draws one: the slot costs 4 MiB of pixels, so a game without native
     /// mods holds none of them.
     pub fn build_over_with_image(root: &Path, defaults: &Path, mod_image: bool) -> Result<Self> {
+        // `mut` only where the wgpu HUD exists: a pack's `core/text` shader
+        // draws through it, and targets without one keep `text_shader` None.
+        #[allow(unused_mut)]
         let mut atlas = Self::pack(root, defaults, WALKED_TEXTURE_FOLDERS, true, mod_image)?;
-        atlas.text_shader = pack_text::load(root, defaults);
-        atlas.lines_shader = pack_text::load_core(
-            root,
-            defaults,
-            "rendertype_lines",
-            &[],
-            &crate::gfx::core_lines::GLUE,
-        );
+        #[cfg(not(target_os = "horizon"))]
+        {
+            atlas.text_shader = pack_text::load(root, defaults);
+            atlas.lines_shader = pack_text::load_core(
+                root,
+                defaults,
+                "rendertype_lines",
+                &[],
+                &crate::gfx::core_lines::GLUE,
+            );
+        }
         Ok(atlas)
     }
     /// Empty slots written at run time: map textures (game/maps.rs), the
@@ -1014,19 +1023,88 @@ impl HudAtlas {
             blinks: Default::default(),
         }
     }
+    /// Menu-only atlas: packs just `folders` (e.g. `["gui", "font", "misc",
+    /// "environment"]`) with none of the full atlas's extras — no run-time
+    /// slots, no CIT or atlas-definition sprites, no `horizon/missing` — and
+    /// a small cap on its side and glyph rows, for targets where the ~80 MB
+    /// the full atlas holds does not fit. `sprite_or_missing` finds no
+    /// missing sprite here, and `text_shader` stays `None`.
+    pub fn build_gui_subset(root: &Path, defaults: &Path, folders: &[&str]) -> Result<Self> {
+        // 2048 a side and 128 glyph rows: menu textures at any GUI scale,
+        // ~16 MB of pixels at most, against the full atlas's 16384 and 512.
+        const MAX_SIDE: u32 = 2048;
+        const GLYPHS: u32 = 128;
+        Self::pack_sized(root, defaults, folders, false, false, MAX_SIDE, GLYPHS)
+    }
+    /// Rebuild an atlas from pre-baked parts: pixels and sprite rects packed
+    /// ahead of time and shipped as bytes plus a sprite map, so no PNG walk
+    /// or shelf packing runs at load (the prepare-time path). `white` is the
+    /// `horizon/white` sprite's rect, which `sprites` also carries; `font`
+    /// is the font baked against the same rects.
+    ///
+    /// Against `build`, a baked atlas holds none of the run-time extras:
+    /// `translucent` (particles all draw on the opaque layer), `flags` (every
+    /// sprite samples vanilla's defaults: nearest, repeat), `glint` and
+    /// `glint_armor` (a transparent texel each), `text_shader`,
+    /// `random_textures`, `emissive`, `blinks`, `object_skins` and
+    /// `sprite_animations` are all empty or their defaults — the baker ships
+    /// what it needs in `sprites`, or fills the fields after.
+    pub fn from_baked(
+        pixels: Vec<u8>,
+        width: u32,
+        height: u32,
+        sprites: HashMap<String, Rect>,
+        white: Rect,
+        font: crate::font::Font,
+    ) -> Self {
+        Self {
+            revision: Self::next_revision(),
+            galactic_widths: galactic_widths(&sprites, &pixels, width, height),
+            packed: None,
+            object_skins: HashMap::new(),
+            object_skins_revision: Self::next_revision(),
+            translucent: HashSet::new(),
+            flags: HashMap::new(),
+            sprite_animations: Vec::new(),
+            glint: (vec![0; 4], 1, 1),
+            glint_armor: (vec![0; 4], 1, 1),
+            text_shader: None,
+            lines_shader: None,
+            random_textures: Default::default(),
+            emissive: Default::default(),
+            blinks: Default::default(),
+            pixels,
+            width,
+            height,
+            sprites,
+            font,
+            white,
+        }
+    }
     /// `layout`, but when `extras` (Custom Item Textures) make the images more than `max`
     /// holds, without them: they are left out, not the packs.
+    #[cfg(test)]
     fn layout_leaving_out(
         images: &mut Vec<PackedImage>,
         animated: &mut Vec<String>,
         extras: &HashSet<String>,
         max: u32,
     ) -> Result<(u32, Vec<(u32, u32)>, u32)> {
-        match Self::layout(images, max) {
+        Self::layout_leaving_out_rows(images, animated, extras, max, GLYPH_ROWS)
+    }
+    /// `layout_leaving_out`, reserving `glyph_rows` rows for run-time glyphs.
+    fn layout_leaving_out_rows(
+        images: &mut Vec<PackedImage>,
+        animated: &mut Vec<String>,
+        extras: &HashSet<String>,
+        max: u32,
+        glyph_rows: u32,
+    ) -> Result<(u32, Vec<(u32, u32)>, u32)> {
+        match Self::layout_rows(images, max, glyph_rows) {
             Err(e) if !extras.is_empty() => {
                 images.retain(|i| !extras.contains(&i.0));
                 animated.retain(|n| !extras.contains(n));
-                let layout = Self::layout(images, max)?;
+                let layout = Self::layout_rows(images, max, glyph_rows)?;
                 log::warn!("left out the custom item textures: {e}");
                 Ok(layout)
             }
@@ -1043,14 +1121,24 @@ impl HudAtlas {
     /// much unused is tried again with each image in the first shelf with
     /// room: a pack of thousands of mixed sizes (server packs with custom
     /// items) fits where the shelves' ragged ends would not.
+    #[cfg(test)]
     fn layout(images: &[PackedImage], max: u32) -> Result<(u32, Vec<(u32, u32)>, u32)> {
+        Self::layout_rows(images, max, GLYPH_ROWS)
+    }
+    /// `layout`, reserving `glyph_rows` rows under the shelves for glyphs
+    /// rasterized at run time.
+    fn layout_rows(
+        images: &[PackedImage],
+        max: u32,
+        glyph_rows: u32,
+    ) -> Result<(u32, Vec<(u32, u32)>, u32)> {
         let mut width = 4096.min(max);
         loop {
             let wide_enough = images.iter().all(|i| i.1 < width);
             if wide_enough {
                 for first_fit in [false, true] {
                     let (placements, glyph_region) = Self::shelves(images, width, first_fit);
-                    if glyph_region + GLYPH_ROWS <= max {
+                    if glyph_region + glyph_rows <= max {
                         return Ok((width, placements, glyph_region));
                     }
                 }
@@ -1102,6 +1190,28 @@ impl HudAtlas {
         full: bool,
         mod_image: bool,
     ) -> Result<Self> {
+        Self::pack_sized(
+            root,
+            defaults,
+            folders,
+            full,
+            mod_image,
+            MAX_ATLAS_SIZE,
+            GLYPH_ROWS,
+        )
+    }
+    /// `pack` under a different budget: `max_width` the largest atlas side
+    /// (`width` starts at 4096 or under it), `glyph_rows` the rows reserved
+    /// under the shelves for glyphs rasterized at run time.
+    fn pack_sized(
+        root: &Path,
+        defaults: &Path,
+        folders: &[&str],
+        full: bool,
+        mod_image: bool,
+        max_width: u32,
+        glyph_rows: u32,
+    ) -> Result<Self> {
         let textures = root.join("assets/minecraft/textures");
         let default_textures =
             (defaults != root).then(|| defaults.join("assets/minecraft/textures"));
@@ -1146,7 +1256,10 @@ impl HudAtlas {
         }
         files.retain(|p| {
             let s = p.to_string_lossy();
-            !s.contains("title/background") && !s.contains("presets")
+            // A GUI subset (`build_gui_subset`, the 3DS menus) has no Realms screens.
+            !s.contains("title/background")
+                && !s.contains("presets")
+                && (full || !s.contains("realms"))
         });
         // OptiFine random entity variants, under the names their scan gives them (those
         // outside `textures/` are `<ns>:optifine/random/...`).
@@ -1333,10 +1446,13 @@ impl HudAtlas {
         }
         images.push(("horizon/white".into(), 4, 4, vec![255; 64]));
         // The controller's art, unless a pack brought its own (walked above, as a mod's GUI
-        // textures are).
-        for image in crate::pad_glyph::images() {
-            if !images.iter().any(|i| i.0 == image.0) {
-                images.push(image);
+        // textures are). Only the `full` atlas: a GUI subset (`build_gui_subset`, the 3DS
+        // menus) draws no controller glyphs, and the art would grow it by a third.
+        if full {
+            for image in crate::pad_glyph::images() {
+                if !images.iter().any(|i| i.0 == image.0) {
+                    images.push(image);
+                }
             }
         }
         if full {
@@ -1362,11 +1478,16 @@ impl HudAtlas {
             }
         }
         images.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)));
-        let (width, placements, glyph_region) =
-            Self::layout_leaving_out(&mut images, &mut animated, &cit_names, MAX_ATLAS_SIZE)?;
+        let (width, placements, glyph_region) = Self::layout_leaving_out_rows(
+            &mut images,
+            &mut animated,
+            &cit_names,
+            max_width,
+            glyph_rows,
+        )?;
         // A multiple of 1024 rather than a power of two: the default resources
         // need 4096x5120 (8192 rows before), Faithful 32x 4096x12288 (16384).
-        let height = (glyph_region + GLYPH_ROWS).next_multiple_of(1024);
+        let height = (glyph_region + glyph_rows).next_multiple_of(1024);
         let mut pixels = vec![0u8; (width * height * 4) as usize];
         let mut sprites = HashMap::new();
         let mut translucent = HashSet::new();
@@ -2326,6 +2447,7 @@ fn inline_profile_name(profile: &serde_json::Value) -> Option<&str> {
         .or_else(|| profile.get("name").and_then(serde_json::Value::as_str))
 }
 
+#[cfg(not(target_os = "horizon"))]
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct HudUniform {
@@ -2333,6 +2455,7 @@ struct HudUniform {
     /// `EndPortalFill`: the two sprites, then the game time in x.
     end_portal: [[f32; 4]; 3],
 }
+#[cfg(not(target_os = "horizon"))]
 impl HudUniform {
     fn new(size: [f32; 4], fill: EndPortalFill, glint_colour: u32) -> Self {
         let [r, g, b, _] = glint_colour.to_le_bytes().map(|c| f32::from(c) / 255.0);
@@ -2351,6 +2474,7 @@ impl HudUniform {
         }
     }
 }
+#[cfg(not(target_os = "horizon"))]
 pub struct HudRenderer {
     pub sprite_animations: Vec<(Rect, crate::sprites::SpriteAnimation, (usize, usize, u32))>,
     /// The shared atlas texture, for run-time glyph uploads.
@@ -2378,6 +2502,7 @@ pub struct HudRenderer {
     /// window (`Renderer::screenshot_quality`).
     pub zoom: f32,
 }
+#[cfg(not(target_os = "horizon"))]
 impl HudRenderer {
     pub fn new(
         device: &wgpu::Device,
