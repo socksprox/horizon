@@ -286,6 +286,17 @@ impl BlockFacts {
         Ok(Self::load_with_callback(root, registry, behaviours, true, |_| Ok(()))?.0)
     }
 
+    /// `load_with_behaviour_json` with explicit `parallel` control. Targets
+    /// with a small heap (armv6k-nintendo-3ds) cannot afford the parallel
+    /// validation pass living beside the decode.
+    pub fn load_with_behaviour_json_seq(
+        root: &Path,
+        registry: &BlockRegistry,
+        behaviours: &Value,
+    ) -> Result<Self> {
+        Ok(Self::load_with_callback(root, registry, behaviours, false, |_| Ok(()))?.0)
+    }
+
     /// Build both tables from the same behaviour document and gameplay decoder.
     pub fn load_with_behaviours(
         root: &Path,
