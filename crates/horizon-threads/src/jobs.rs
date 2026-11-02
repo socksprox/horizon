@@ -21,9 +21,17 @@
 //! of its sources and nothing else, so a source may call [`Pool::notify`]
 //! anywhere, its queue's lock held or not; a notify never waits for a worker.
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{self, AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, Instant};
+
+/// 64-bit where the target has 64-bit atomics; a narrower counter wraps
+/// harmlessly and keeps targets without them (armv6k-nintendo-3ds)
+/// compiling.
+#[cfg(target_has_atomic = "64")]
+type AtomicCount = atomic::AtomicU64;
+#[cfg(not(target_has_atomic = "64"))]
+type AtomicCount = atomic::AtomicU32;
 
 /// How urgent a job is, before its source's key: every queued job of a lower
 /// class runs before any of a higher one.
@@ -123,13 +131,13 @@ struct Entry {
 struct Inner {
     /// Read by every choice, written only to add or take out a source.
     sources: RwLock<Vec<Arc<Entry>>>,
-    next_id: AtomicU64,
+    next_id: AtomicCount,
     /// Bumped by every [`Pool::notify`]: a worker that found nothing sleeps
     /// until it changes, so a job queued while it looked is not missed. A
     /// notify is two atomic operations while every worker is busy, and takes
     /// `sleep` (held by no source code) only to wake one: the thread queuing
     /// work (a frame, a tick) never waits behind a worker's choice.
-    epoch: AtomicU64,
+    epoch: AtomicCount,
     sleepers: AtomicUsize,
     sleep: Mutex<()>,
     wake: Condvar,
@@ -205,8 +213,8 @@ impl Pool {
     pub fn with_idle_release(threads: usize, name: &str, idle_release: Duration) -> Self {
         let inner = Arc::new(Inner {
             sources: RwLock::new(Vec::new()),
-            next_id: AtomicU64::new(0),
-            epoch: AtomicU64::new(0),
+            next_id: AtomicCount::new(0),
+            epoch: AtomicCount::new(0),
             sleepers: AtomicUsize::new(0),
             sleep: Mutex::new(()),
             wake: Condvar::new(),
@@ -245,7 +253,7 @@ impl Pool {
 
     /// Add a source; its jobs run until the registration is dropped.
     pub fn register(&self, source: Arc<dyn Source>) -> Registration {
-        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed) as u64;
         self.inner
             .sources
             .write()

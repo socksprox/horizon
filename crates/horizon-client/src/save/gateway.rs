@@ -121,7 +121,7 @@ impl SaveDir {
 mod tests {
     use super::*;
     use horizon_world::chunk::ChunkData;
-    static NEXT: AtomicU64 = AtomicU64::new(0);
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     fn fixture() -> (PathBuf, SaveDir) {
         let dir = std::env::temp_dir().join(format!(

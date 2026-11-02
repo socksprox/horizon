@@ -1587,11 +1587,18 @@ impl SoundEngine {
 }
 /// `RandomSupport.generateUniqueSeed`.
 pub fn unique_seed() -> i64 {
-    use std::sync::atomic::{AtomicI64, Ordering};
-    static UNIQUIFIER: AtomicI64 = AtomicI64::new(8_682_522_807_148_012);
+    use std::sync::atomic::{self, Ordering};
+    /// 64-bit where the target has 64-bit atomics; a narrower counter wraps
+    /// harmlessly and keeps targets without them (armv6k-nintendo-3ds)
+    /// compiling.
+    #[cfg(target_has_atomic = "64")]
+    type AtomicCount = atomic::AtomicI64;
+    #[cfg(not(target_has_atomic = "64"))]
+    type AtomicCount = atomic::AtomicI32;
+    static UNIQUIFIER: AtomicCount = AtomicCount::new(8_682_522_807_148_012i64 as _);
     let mut current = UNIQUIFIER.load(Ordering::Relaxed);
     let next = loop {
-        let next = current.wrapping_mul(1_181_783_497_276_652_981);
+        let next = current.wrapping_mul(1_181_783_497_276_652_981i64 as _);
         match UNIQUIFIER.compare_exchange(current, next, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => break next,
             Err(v) => current = v,
@@ -1600,7 +1607,7 @@ pub fn unique_seed() -> i64 {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as i64);
-    next ^ nanos
+    next as i64 ^ nanos
 }
 /// The `SoundManager` calls game code makes.
 pub trait Sounds {

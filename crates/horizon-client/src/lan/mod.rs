@@ -48,12 +48,20 @@ use std::{
     net::{IpAddr, SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{self, AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering},
         mpsc::{Receiver, Sender, channel},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
+
+/// 64-bit where the target has 64-bit atomics; a narrower counter wraps
+/// harmlessly and keeps targets without them (armv6k-nintendo-3ds)
+/// compiling.
+#[cfg(target_has_atomic = "64")]
+type AtomicCount = atomic::AtomicU64;
+#[cfg(not(target_has_atomic = "64"))]
+type AtomicCount = atomic::AtomicU32;
 
 /// IntegratedServer.MAX_PLAYERS.
 pub const MAX_PLAYERS: usize = 8;
@@ -390,7 +398,7 @@ pub struct Shared {
     by_address: Mutex<HashMap<IpAddr, usize>>,
     /// Those not playing yet (handshake, status, login, configuration), oldest first.
     waiting: Mutex<Vec<Waiting>>,
-    next_connection: AtomicU64,
+    next_connection: AtomicCount,
     /// Those whose play ended, waiting for their writer to finish.
     closing: AtomicUsize,
     /// Connections turned away since the last report of them, and when that was.
@@ -628,7 +636,7 @@ impl Lan {
             connections: AtomicUsize::new(0),
             by_address: Mutex::new(HashMap::new()),
             waiting: Mutex::new(Vec::new()),
-            next_connection: AtomicU64::new(0),
+            next_connection: AtomicCount::new(0),
             closing: AtomicUsize::new(0),
             turned_away: Mutex::new((0, None)),
             random: Mutex::new(crate::server::java_properties::now_millis() as u64 | 1),
@@ -825,7 +833,7 @@ impl Shared {
         let n = here(&by) + 1;
         by.insert(ip, n);
         self.connections.fetch_add(1, Ordering::AcqRel);
-        let id = self.next_connection.fetch_add(1, Ordering::Relaxed);
+        let id = self.next_connection.fetch_add(1, Ordering::Relaxed) as u64;
         Some(Counted(self.clone(), ip, id))
     }
 

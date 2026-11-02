@@ -44,10 +44,18 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{self, Ordering},
         mpsc,
     },
 };
+
+/// 64-bit where the target has 64-bit atomics; a narrower counter wraps
+/// harmlessly and keeps targets without them (armv6k-nintendo-3ds)
+/// compiling.
+#[cfg(target_has_atomic = "64")]
+type AtomicCount = atomic::AtomicU64;
+#[cfg(not(target_has_atomic = "64"))]
+type AtomicCount = atomic::AtomicU32;
 
 pub const VERSION_NAME: &str = horizon_core::VANILLA_VERSION;
 
@@ -2403,7 +2411,7 @@ pub struct SaveDir {
     entity_regions: Arc<RegionCache>,
     poi_regions: Arc<RegionCache>,
     pending: Arc<PendingWrites>,
-    sequence: AtomicU64,
+    sequence: AtomicCount,
     writer: Mutex<Option<Writer>>,
     outstanding: Arc<Outstanding>,
     /// Set by `Persistent` before the first load.
@@ -2501,7 +2509,7 @@ impl SaveDir {
             entity_regions: Default::default(),
             poi_regions: Default::default(),
             pending: Default::default(),
-            sequence: AtomicU64::new(0),
+            sequence: AtomicCount::new(0),
             writer: Mutex::new(None),
             outstanding: Default::default(),
             tables: OnceLock::new(),
@@ -2792,7 +2800,7 @@ impl SaveDir {
             {
                 let mut pending = self.pending.lock().map_err(|_| "pending writes poisoned")?;
                 for (key, record) in records {
-                    let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
+                    let seq = self.sequence.fetch_add(1, Ordering::Relaxed) as u64;
                     pending.insert((folder, key.0, key.1), (seq, record.clone()));
                     batch.push((key, record, seq));
                 }
@@ -3251,22 +3259,20 @@ pub use horizon_client_core::uuid::{uuid_from_text, uuid_text};
 /// macOS): a pack of mobs generated together all had the same UUID, and a
 /// vanilla client keeps only one entity per UUID (the rest never moved).
 pub fn random_uuid() -> [i32; 4] {
-    use std::sync::{
-        OnceLock,
-        atomic::{AtomicU64, Ordering},
-    };
-    static NEXT: OnceLock<AtomicU64> = OnceLock::new();
+    use std::sync::{OnceLock, atomic::Ordering};
+    static NEXT: OnceLock<AtomicCount> = OnceLock::new();
     let next = NEXT.get_or_init(|| {
         let t = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as u64);
-        AtomicU64::new(t ^ (std::process::id() as u64).rotate_left(32))
+        AtomicCount::new((t ^ (std::process::id() as u64).rotate_left(32)) as _)
     });
     // SplitMix64: distinct steps give distinct outputs.
     let split = || {
-        let mut z = next
-            .fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed)
-            .wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = u64::from(
+            next.fetch_add(0x9E37_79B9_7F4A_7C15u64 as _, Ordering::Relaxed)
+                .wrapping_add(0x9E37_79B9_7F4A_7C15u64 as _),
+        );
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)

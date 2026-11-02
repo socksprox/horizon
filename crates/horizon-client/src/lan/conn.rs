@@ -28,11 +28,19 @@ use std::{
     net::TcpStream,
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicUsize, Ordering},
+        atomic::{self, AtomicI32, AtomicU32, AtomicUsize, Ordering},
         mpsc::{RecvTimeoutError, Sender, channel},
     },
     time::{Duration, Instant},
 };
+
+/// 64-bit where the target has 64-bit atomics; a narrower counter wraps
+/// harmlessly and keeps targets without them (armv6k-nintendo-3ds)
+/// compiling.
+#[cfg(target_has_atomic = "64")]
+type AtomicCount = atomic::AtomicI64;
+#[cfg(not(target_has_atomic = "64"))]
+type AtomicCount = atomic::AtomicI32;
 
 /// ServerCommonPacketListenerImpl.keepConnectionAlive: a keep-alive every 15 s,
 /// and a client that has not answered the last one by the next is dropped.
@@ -1315,7 +1323,7 @@ fn play(
     let latency = Arc::new(AtomicI32::new(0));
     let watch = Arc::new(KeepAliveWatch {
         start: Instant::now(),
-        alive: Arc::new(AtomicI64::new(-1)),
+        alive: Arc::new(AtomicCount::new(-1)),
     });
     let sender = PlayerSender {
         pending,
@@ -1399,7 +1407,7 @@ impl io_pool::Session for PlayConn {
         }
         match play::Serverbound::decode(id, &payload).and_then(checked_play) {
             Ok(play::Serverbound::KeepAlive(k)) => {
-                self.watch.alive.store(k.id, Ordering::Relaxed);
+                self.watch.alive.store(k.id as _, Ordering::Relaxed);
                 if let Some((sent, at)) = self.sent_at
                     && k.id == sent
                 {
@@ -1654,7 +1662,7 @@ struct KeepAliveWatch {
     /// What keep-alive ids count from: an id is its sending time in ms.
     start: Instant,
     /// The id of the last keep-alive the client answered (-1: none yet).
-    alive: Arc<AtomicI64>,
+    alive: Arc<AtomicCount>,
 }
 impl KeepAliveWatch {
     /// keepConnectionAlive sends a keep-alive 15 s after the last and drops
@@ -1979,7 +1987,7 @@ mod tests {
         let ago = |s| Instant::now().checked_sub(Duration::from_secs(s)).unwrap();
         let watch = |start, answered| KeepAliveWatch {
             start,
-            alive: Arc::new(AtomicI64::new(answered)),
+            alive: Arc::new(AtomicCount::new(answered)),
         };
         assert!(!watch(ago(29), -1).timed_out());
         assert!(watch(ago(31), -1).timed_out());

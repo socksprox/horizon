@@ -12,9 +12,17 @@ use std::{
     collections::HashMap,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{self, Ordering},
     },
 };
+
+/// 64-bit where the target has 64-bit atomics; a narrower counter wraps
+/// harmlessly and keeps targets without them (armv6k-nintendo-3ds)
+/// compiling.
+#[cfg(target_has_atomic = "64")]
+type AtomicCount = atomic::AtomicU64;
+#[cfg(not(target_has_atomic = "64"))]
+type AtomicCount = atomic::AtomicU32;
 
 /// An entity's UUID as its four ints (`UUIDUtil.CODEC`).
 pub type Uuid = [i32; 4];
@@ -129,13 +137,13 @@ pub struct ModRevision {
     born: u64,
     changes: u64,
 }
-static MOD_BLOCK_ENTITIES_MADE: AtomicU64 = AtomicU64::new(0);
+static MOD_BLOCK_ENTITIES_MADE: AtomicCount = AtomicCount::new(0);
 impl ModBlockEntity {
     pub fn new(fields: ModBlockEntityFields) -> Self {
         Self {
             fields,
             revision: ModRevision {
-                born: MOD_BLOCK_ENTITIES_MADE.fetch_add(1, Ordering::Relaxed),
+                born: MOD_BLOCK_ENTITIES_MADE.fetch_add(1, Ordering::Relaxed) as u64,
                 changes: 0,
             },
         }

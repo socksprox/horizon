@@ -2,7 +2,7 @@
 //! A paused pass
 //! observes nothing; a frozen world reports `world_running: false` except during a step.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{self, Ordering};
 
 use super::{Game, execution_role::ExecutionRole};
 // Their old home, for mixin code that names them here.
@@ -11,14 +11,22 @@ pub(super) use horizon_client::mod_api::{
     WorldPhase,
 };
 
+/// 64-bit where the target has 64-bit atomics; a narrower counter wraps
+/// harmlessly and keeps targets without them (armv6k-nintendo-3ds)
+/// compiling.
+#[cfg(target_has_atomic = "64")]
+type AtomicCount = atomic::AtomicU64;
+#[cfg(not(target_has_atomic = "64"))]
+type AtomicCount = atomic::AtomicU32;
+
 /// Epoch allocation spans `Game` instances (a new server `Game` per
 /// launch), so the counter is process-wide.
-static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+static NEXT_EPOCH: AtomicCount = AtomicCount::new(1);
 
 /// A process-wide epoch no handle has carried yet: a server open's, or a
 /// client level's (`native_entity_refs.rs`), so a handle never crosses sides.
 pub(super) fn fresh_epoch() -> NativeWorldEpoch {
-    NativeWorldEpoch::new(NEXT_EPOCH.fetch_add(1, Ordering::Relaxed))
+    NativeWorldEpoch::new(NEXT_EPOCH.fetch_add(1, Ordering::Relaxed) as u64)
 }
 
 /// Internal state for deciding which events can fire.

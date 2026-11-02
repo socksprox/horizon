@@ -7,9 +7,17 @@
 //! ([`Deref`]) first waits for that frame to be submitted, so writes, copies and
 //! submissions keep the order they had on one thread.
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{self, AtomicBool, Ordering};
 use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
+
+/// 64-bit where the target has 64-bit atomics; a narrower counter wraps
+/// harmlessly and keeps targets without them (armv6k-nintendo-3ds)
+/// compiling.
+#[cfg(target_has_atomic = "64")]
+type AtomicCount = atomic::AtomicU64;
+#[cfg(not(target_has_atomic = "64"))]
+type AtomicCount = atomic::AtomicU32;
 
 /// Whether frames go to the submit thread, unless `HORIZON_SUBMIT_THREAD` says (`0` off, `1` on):
 /// on Linux, where it was measured faster (+32% FPS in a CPU-bound view on Vulkan, #5779). On
@@ -53,7 +61,7 @@ pub struct Queue {
     landing: Mutex<Option<Landing>>,
     /// Nanoseconds the window's thread waited for the submit thread since the last
     /// [`take_waited`](Self::take_waited): the GPU or the display holding a frame back, not work.
-    waited: AtomicU64,
+    waited: AtomicCount,
 }
 
 impl Queue {
@@ -64,7 +72,7 @@ impl Queue {
             thread: None,
             pending: AtomicBool::new(false),
             landing: Mutex::new(None),
-            waited: AtomicU64::new(0),
+            waited: AtomicCount::new(0),
         };
         if !threaded {
             return this;
@@ -143,7 +151,7 @@ impl Queue {
                 .expect("Horizon renderer: the submit thread stopped");
             l.landed = Some(submission);
             let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            self.waited.fetch_add(nanos, Ordering::Relaxed);
+            self.waited.fetch_add(nanos as _, Ordering::Relaxed);
         }
         self.pending.store(false, Ordering::Release);
     }
@@ -151,7 +159,7 @@ impl Queue {
     /// GPU-bound view, the previous frame's submission and present hold up every use of the
     /// queue (uploads in the frame's first half too), and that is waiting, not the frame's work.
     pub fn take_waited(&self) -> Duration {
-        Duration::from_nanos(self.waited.swap(0, Ordering::Relaxed))
+        Duration::from_nanos(self.waited.swap(0, Ordering::Relaxed) as u64)
     }
     /// The submission of the frame [`submit_later`](Self::submit_later) took, once it is
     /// made; `None` if it was taken already.

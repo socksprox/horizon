@@ -138,13 +138,20 @@ enum Target {
 /// (`RandomSupport.generateUniqueSeed`). Draws of an entity's own random never
 /// touch the level's stream.
 pub(super) fn entity_random() -> LegacyRandom {
-    use std::sync::atomic::{AtomicI64, Ordering};
-    static UNIQUIFIER: AtomicI64 = AtomicI64::new(8_682_522_807_148_012);
+    use std::sync::atomic::{self, Ordering};
+    /// 64-bit where the target has 64-bit atomics; a narrower counter wraps
+    /// harmlessly and keeps targets without them (armv6k-nintendo-3ds)
+    /// compiling.
+    #[cfg(target_has_atomic = "64")]
+    type AtomicCount = atomic::AtomicI64;
+    #[cfg(not(target_has_atomic = "64"))]
+    type AtomicCount = atomic::AtomicI32;
+    static UNIQUIFIER: AtomicCount = AtomicCount::new(8_682_522_807_148_012i64 as _);
     const STEP: i64 = 1_181_783_497_276_652_981;
     // seedUniquifier.updateAndGet(s -> s * STEP)
     let mut current = UNIQUIFIER.load(Ordering::Relaxed);
     let seed = loop {
-        let next = current.wrapping_mul(STEP);
+        let next = current.wrapping_mul(STEP as _);
         match UNIQUIFIER.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
         {
             Ok(_) => break next,
@@ -154,7 +161,7 @@ pub(super) fn entity_random() -> LegacyRandom {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as i64);
-    LegacyRandom::new(seed ^ nanos)
+    LegacyRandom::new(seed as i64 ^ nanos)
 }
 /// `new ItemEntity(level, x, y, z, stack)`'s motion, from the item's own random.
 pub(super) fn new_item_motion() -> [f64; 3] {

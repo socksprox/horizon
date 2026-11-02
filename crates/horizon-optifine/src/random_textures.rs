@@ -84,8 +84,15 @@ struct Source {
 
 impl RandomTextures {
     pub fn scan(root: &Path) -> Self {
-        static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // 64-bit where the target has 64-bit atomics; a narrower counter
+        // wraps harmlessly and keeps targets without them
+        // (armv6k-nintendo-3ds) compiling.
+        #[cfg(target_has_atomic = "64")]
+        type AtomicCount = std::sync::atomic::AtomicU64;
+        #[cfg(not(target_has_atomic = "64"))]
+        type AtomicCount = std::sync::atomic::AtomicU32;
+        static GENERATION: AtomicCount = AtomicCount::new(1);
+        let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64;
         Self {
             generation,
             ..Self::scan_files(root)

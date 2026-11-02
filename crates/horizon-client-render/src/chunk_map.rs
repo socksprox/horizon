@@ -11,15 +11,23 @@ use std::{
     ops::Deref,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{self, Ordering},
     },
 };
 
+/// 64-bit where the target has 64-bit atomics; a narrower counter wraps
+/// harmlessly and keeps targets without them (armv6k-nintendo-3ds)
+/// compiling.
+#[cfg(target_has_atomic = "64")]
+type AtomicCount = atomic::AtomicU64;
+#[cfg(not(target_has_atomic = "64"))]
+type AtomicCount = atomic::AtomicU32;
+
 type Key = (i32, i32);
 type Columns = FxHashMap<Key, Arc<Chunk>>;
-static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
+static NEXT_REVISION: AtomicCount = AtomicCount::new(1);
 fn next_revision() -> u64 {
-    NEXT_REVISION.fetch_add(1, Ordering::Relaxed)
+    NEXT_REVISION.fetch_add(1, Ordering::Relaxed) as u64
 }
 
 /// The membership changes one map keeps for the consumers that read them

@@ -120,9 +120,14 @@ pub const SPRITE_SIZE: u32 = 16;
 /// The largest sprite array (all layers of the top mip level) when the settings leave it to
 /// Horizon: resource packs with bigger textures are sampled down to fit.
 pub const DEFAULT_TEXTURE_BUDGET: u64 = 256 << 20;
+/// 64-bit where the target has 64-bit atomics; a narrower budget wraps
+/// harmlessly and keeps targets without them (armv6k-nintendo-3ds) compiling.
+#[cfg(target_has_atomic = "64")]
+type AtomicCount = std::sync::atomic::AtomicU64;
+#[cfg(not(target_has_atomic = "64"))]
+type AtomicCount = std::sync::atomic::AtomicU32;
 /// The budget in bytes the next resource load keeps to (`set_texture_budget`).
-static TEXTURE_BUDGET: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(DEFAULT_TEXTURE_BUDGET);
+static TEXTURE_BUDGET: AtomicCount = AtomicCount::new(DEFAULT_TEXTURE_BUDGET as _);
 /// The block textures' budget from the `textureBudgetMiB` setting (0 for the default), for
 /// resources loaded from now on.
 pub fn set_texture_budget(mib: u32) {
@@ -130,7 +135,7 @@ pub fn set_texture_budget(mib: u32) {
         0 => DEFAULT_TEXTURE_BUDGET,
         mib => u64::from(mib) << 20,
     };
-    TEXTURE_BUDGET.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    TEXTURE_BUDGET.store(bytes as _, std::sync::atomic::Ordering::Relaxed);
 }
 /// Whether resource loads read the resource packs' LabPBR maps (`set_labpbr_maps`).
 static LABPBR_MAPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -151,7 +156,7 @@ fn map_bytes(texture_budget: u64) -> u64 {
 }
 /// [`map_bytes`] for the budget the next resource load keeps to.
 fn max_map_bytes() -> u64 {
-    map_bytes(TEXTURE_BUDGET.load(std::sync::atomic::Ordering::Relaxed))
+    map_bytes(TEXTURE_BUDGET.load(std::sync::atomic::Ordering::Relaxed) as u64)
 }
 /// Fewer layers than any game has (vanilla's are about 1300): what a map is kept at while
 /// loading assumes at least these many share the array.
@@ -251,7 +256,7 @@ impl Sprites {
         let layers = self.native.len().max(1) as u64;
         let largest = self.native.iter().map(|n| n.0).max().unwrap_or(SPRITE_SIZE);
         self.minimum_size = self.native.iter().map(|n| n.0).min().unwrap_or(SPRITE_SIZE);
-        let budget = TEXTURE_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+        let budget = TEXTURE_BUDGET.load(std::sync::atomic::Ordering::Relaxed) as u64;
         let size = side_within(largest, layers, budget);
         if pixels {
             log::info!(

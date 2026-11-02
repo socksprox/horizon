@@ -1288,8 +1288,15 @@ const SIGN_TEXT_KEEP: i64 = 100;
 /// block-entity positions in the last few seconds.
 const STATIC_GEOMETRY_MAX_ENTRIES: usize = 4096;
 fn next_static_snapshot_revision() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
+    // 64-bit where the target has 64-bit atomics; a narrower counter
+    // wraps harmlessly and keeps targets without them
+    // (armv6k-nintendo-3ds) compiling.
+    #[cfg(target_has_atomic = "64")]
+    type AtomicCount = std::sync::atomic::AtomicU64;
+    #[cfg(not(target_has_atomic = "64"))]
+    type AtomicCount = std::sync::atomic::AtomicU32;
+    static NEXT: AtomicCount = AtomicCount::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed) as u64
 }
 const MODELS: [(&str, &str); 27] = [
     ("chest", "minecraft:chest#main"),

@@ -25,7 +25,18 @@ use horizon_world::{
         terrain::PreLightChunkStage,
     },
 };
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{Arc, atomic},
+};
+
+/// 64-bit where the target has 64-bit atomics; a narrower counter wraps
+/// harmlessly and keeps targets without them (armv6k-nintendo-3ds)
+/// compiling.
+#[cfg(target_has_atomic = "64")]
+type AtomicCount = atomic::AtomicU64;
+#[cfg(not(target_has_atomic = "64"))]
+type AtomicCount = atomic::AtomicU32;
 mod lod;
 mod structure_mobs;
 use lod::VanillaLodSampler;
@@ -61,7 +72,7 @@ pub struct VanillaTerrain {
     dimension: String,
     /// When the last proto chunk was generated, in milliseconds since
     /// `created`: the ring search waits for a pause in generation.
-    last_proto: std::sync::atomic::AtomicU64,
+    last_proto: AtomicCount,
     created: std::time::Instant,
     /// A superflat generator (`FlatLevelSource`).
     flat: bool,
@@ -334,7 +345,7 @@ impl VanillaTerrain {
             saved_references: Default::default(),
             preset: preset.to_owned(),
             dimension: dimension.to_owned(),
-            last_proto: std::sync::atomic::AtomicU64::new(0),
+            last_proto: AtomicCount::new(0),
             created: std::time::Instant::now(),
             flat: false,
         })
@@ -662,7 +673,8 @@ impl VanillaTerrain {
                     let now = terrain.elapsed_ms();
                     let last = terrain
                         .last_proto
-                        .load(std::sync::atomic::Ordering::Relaxed);
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        as u64;
                     if now >= LATEST || (last > 0 && now - last >= QUIET) {
                         let _ = terrain
                             .generator
@@ -770,7 +782,7 @@ impl ChunkGenerator for VanillaTerrain {
     }
     fn proto(&self, worker: &mut GeneratorWorker, x: i32, z: i32) -> Proto {
         self.last_proto.store(
-            self.elapsed_ms().max(1),
+            self.elapsed_ms().max(1) as _,
             std::sync::atomic::Ordering::Relaxed,
         );
         match worker.generate_proto(ChunkPos::new(x, z)) {

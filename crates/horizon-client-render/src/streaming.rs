@@ -29,13 +29,20 @@ pub const IDLE_RELEASE: std::time::Duration = std::time::Duration::from_secs(5);
 /// (`examples/gen_light_bench.rs`). Off unless enabled: a relaxed load per
 /// job then.
 pub mod job_stats {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{self, AtomicBool, Ordering};
+    /// 64-bit where the target has 64-bit atomics; a narrower counter
+    /// wraps harmlessly and keeps targets without them
+    /// (armv6k-nintendo-3ds) compiling.
+    #[cfg(target_has_atomic = "64")]
+    type AtomicCount = atomic::AtomicU64;
+    #[cfg(not(target_has_atomic = "64"))]
+    type AtomicCount = atomic::AtomicU32;
     pub const KINDS: [&str; 7] = [
         "load", "generate", "decorate", "finish", "light", "mesh", "other",
     ];
     static ENABLED: AtomicBool = AtomicBool::new(false);
-    static NANOS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
-    static COUNT: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    static NANOS: [AtomicCount; 7] = [const { AtomicCount::new(0) }; 7];
+    static COUNT: [AtomicCount; 7] = [const { AtomicCount::new(0) }; 7];
     pub fn enable(on: bool) {
         ENABLED.store(on, Ordering::Relaxed);
     }
@@ -43,7 +50,7 @@ pub mod job_stats {
         ENABLED.load(Ordering::Relaxed)
     }
     pub(super) fn add(kind: usize, nanos: u64) {
-        NANOS[kind].fetch_add(nanos, Ordering::Relaxed);
+        NANOS[kind].fetch_add(nanos as _, Ordering::Relaxed);
         COUNT[kind].fetch_add(1, Ordering::Relaxed);
     }
     /// (kind, nanoseconds, count) since the last call; resets them.
@@ -52,8 +59,8 @@ pub mod job_stats {
             .map(|i| {
                 (
                     KINDS[i],
-                    NANOS[i].swap(0, Ordering::Relaxed),
-                    COUNT[i].swap(0, Ordering::Relaxed),
+                    NANOS[i].swap(0, Ordering::Relaxed) as u64,
+                    COUNT[i].swap(0, Ordering::Relaxed) as u64,
                 )
             })
             .collect()

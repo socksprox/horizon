@@ -181,13 +181,24 @@ pub fn census() -> Vec<(&'static str, isize)> {
 /// mimalloc with a tag in front of each block (see the module).
 pub struct CensusAllocator;
 
+/// The heap `CensusAllocator` wraps: mimalloc where it builds, the system
+/// heap on 3DS newlib.
+#[cfg(not(target_os = "horizon"))]
+type Inner = mimalloc::MiMalloc;
+#[cfg(target_os = "horizon")]
+type Inner = std::alloc::System;
+#[cfg(not(target_os = "horizon"))]
+const INNER: Inner = mimalloc::MiMalloc;
+#[cfg(target_os = "horizon")]
+const INNER: Inner = std::alloc::System;
+
 /// The header in front of a block of `layout`: 16 bytes, or its alignment.
 fn header(layout: Layout) -> usize {
     layout.align().max(16)
 }
 
-// SAFETY: forwards every call to mimalloc with the header added; the tag sits
-// in the header's last four bytes, inside the block mimalloc returned.
+// SAFETY: forwards every call to `Inner` with the header added; the tag sits
+// in the header's last four bytes, inside the block `Inner` returned.
 unsafe impl GlobalAlloc for CensusAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let h = header(layout);
@@ -195,7 +206,7 @@ unsafe impl GlobalAlloc for CensusAllocator {
             return std::ptr::null_mut();
         };
         // SAFETY: `outer` has a nonzero size.
-        let base = unsafe { mimalloc::MiMalloc.alloc(outer) };
+        let base = unsafe { INNER.alloc(outer) };
         if base.is_null() {
             return base;
         }
@@ -216,7 +227,7 @@ unsafe impl GlobalAlloc for CensusAllocator {
             LIVE[tag as usize].fetch_sub(layout.size() as isize, Relaxed);
             let outer =
                 Layout::from_size_align_unchecked(layout.size() + h, layout.align().max(16));
-            mimalloc::MiMalloc.dealloc(block.sub(h), outer);
+            INNER.dealloc(block.sub(h), outer);
         }
     }
     unsafe fn realloc(&self, block: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -226,7 +237,7 @@ unsafe impl GlobalAlloc for CensusAllocator {
             let outer =
                 Layout::from_size_align_unchecked(layout.size() + h, layout.align().max(16));
             let tag = block.sub(4).cast::<u32>().read_unaligned();
-            let base = mimalloc::MiMalloc.realloc(block.sub(h), outer, new_size + h);
+            let base = INNER.realloc(block.sub(h), outer, new_size + h);
             if base.is_null() {
                 return base;
             }

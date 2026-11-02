@@ -157,13 +157,20 @@ thread_local! {
 }
 
 fn random_start() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{self, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    static THREADS: AtomicU64 = AtomicU64::new(0);
+    /// 64-bit where the target has 64-bit atomics; a narrower counter wraps
+    /// harmlessly and keeps targets without them (armv6k-nintendo-3ds)
+    /// compiling.
+    #[cfg(target_has_atomic = "64")]
+    type AtomicCount = atomic::AtomicU64;
+    #[cfg(not(target_has_atomic = "64"))]
+    type AtomicCount = atomic::AtomicU32;
+    static THREADS: AtomicCount = AtomicCount::new(0);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64);
-    now ^ THREADS.fetch_add(1, Ordering::Relaxed).wrapping_mul(GOLDEN)
+    now ^ u64::from(THREADS.fetch_add(1, Ordering::Relaxed)).wrapping_mul(GOLDEN)
 }
 
 fn random(seed: Option<f32>) -> f32 {

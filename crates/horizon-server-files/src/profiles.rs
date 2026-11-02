@@ -7,6 +7,7 @@ use crate::{
     user_lists::NameAndId,
 };
 use horizon_protocol::rsa::RsaPublicKey;
+#[cfg(not(target_os = "horizon"))]
 use std::time::Duration;
 
 /// Mojang's services discovery document.
@@ -42,6 +43,9 @@ pub fn resolve(name: &str, online: bool) -> Option<NameAndId> {
 /// MinecraftServicesProfileRepository.findProfileByName: the account named
 /// `name` (any case), or None when there is none or the services don't
 /// answer (vanilla logs both as "Couldn't find profile with name").
+/// No HTTPS on the 3DS (armv6k-nintendo-3ds): it answers as the services
+/// being unreachable.
+#[cfg(not(target_os = "horizon"))]
 pub fn find_by_name(discovery: &str, name: &str) -> Option<NameAndId> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(15))
@@ -52,8 +56,15 @@ pub fn find_by_name(discovery: &str, name: &str) -> Option<NameAndId> {
     found(&agent.get(&url).call().ok()?.into_string().ok()?, name)
 }
 
+/// The 3DS's [`find_by_name`]: no HTTPS, so the services never answer.
+#[cfg(target_os = "horizon")]
+pub fn find_by_name(_discovery: &str, _name: &str) -> Option<NameAndId> {
+    None
+}
+
 /// YggdrasilMinecraftSessionService.fetchProfile(id, true), as the management protocol finds a player given by
 /// id that the user cache doesn't know: the `session` / `getProfileById` endpoint, or None.
+#[cfg(not(target_os = "horizon"))]
 pub fn find_by_id(discovery: &str, id: u128) -> Option<NameAndId> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(15))
@@ -73,11 +84,18 @@ pub fn find_by_id(discovery: &str, id: u128) -> Option<NameAndId> {
     found(&answer, &name).filter(|user| user.id == id)
 }
 
+/// The 3DS's [`find_by_id`]: no HTTPS, so the services never answer.
+#[cfg(target_os = "horizon")]
+pub fn find_by_id(_discovery: &str, _id: u128) -> Option<NameAndId> {
+    None
+}
+
 /// MinecraftServicesKeyInfo.get: the services' public keys from the
 /// discovery document's `authentication` / `getPublicKeys` endpoint. The
 /// profile-key keys (`playerCertificateKeys`, ServicesKeyType.PROFILE_KEY)
 /// sign the players' chat keys; secure chat checks them. The error is the
 /// line vanilla logs, after which it has no keys.
+#[cfg(not(target_os = "horizon"))]
 pub fn fetch_profile_key_keys(discovery: &str) -> Result<Vec<RsaPublicKey>, &'static str> {
     const FAILED: &str = "Failed to request Minecraft Services public key";
     let agent = ureq::AgentBuilder::new()
@@ -90,6 +108,13 @@ pub fn fetch_profile_key_keys(discovery: &str) -> Result<Vec<RsaPublicKey>, &'st
         .ok_or(FAILED)?;
     let url = endpoint(&doc, "authentication", "getPublicKeys").ok_or(FAILED)?;
     profile_key_keys(&get(&url).ok_or(FAILED)?)
+}
+
+/// The 3DS's [`fetch_profile_key_keys`]: no HTTPS, so it fails as vanilla's
+/// log line reads when the services don't answer.
+#[cfg(target_os = "horizon")]
+pub fn fetch_profile_key_keys(_discovery: &str) -> Result<Vec<RsaPublicKey>, &'static str> {
+    Err("Failed to request Minecraft Services public key")
 }
 
 /// The key set answer: `{"profilePropertyKeys": [...], "playerCertificateKeys":
@@ -125,6 +150,7 @@ pub fn profile_key_keys(answer: &str) -> Result<Vec<RsaPublicKey>, &'static str>
 }
 
 /// MinecraftServicesDiscoveryService.getUrl(service, endpoint).
+#[cfg(not(target_os = "horizon"))]
 fn endpoint(doc: &Json, service: &str, name: &str) -> Option<String> {
     doc.get("discovery")?
         .get(service)?

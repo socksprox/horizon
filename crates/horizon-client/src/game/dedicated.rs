@@ -28,11 +28,19 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{self, AtomicBool, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
 };
+
+/// 64-bit where the target has 64-bit atomics; a narrower counter wraps
+/// harmlessly and keeps targets without them (armv6k-nintendo-3ds)
+/// compiling.
+#[cfg(target_has_atomic = "64")]
+type AtomicCount = atomic::AtomicU64;
+#[cfg(not(target_has_atomic = "64"))]
+type AtomicCount = atomic::AtomicU32;
 
 pub(super) mod events;
 mod management;
@@ -42,10 +50,12 @@ mod transfer;
 
 /// What the tick loop tells `ServerWatchdog`: when the tick in progress was
 /// due (`getNextTickTime`), how long a tick is, and whether the server runs.
+/// Milliseconds, as vanilla's (`Util.getMillis`), so the values still fit
+/// where the target has no 64-bit atomics.
 struct Watchdog {
     base: Instant,
-    next_nanos: AtomicU64,
-    tick_nanos: AtomicU64,
+    next_millis: AtomicCount,
+    tick_millis: AtomicCount,
     running: AtomicBool,
 }
 
@@ -56,8 +66,8 @@ impl Watchdog {
         let max = Duration::from_millis(u64::try_from(max_tick_time).ok().filter(|m| *m > 0)?);
         let watchdog = Arc::new(Self {
             base: Instant::now(),
-            next_nanos: AtomicU64::new(0),
-            tick_nanos: AtomicU64::new(50_000_000),
+            next_millis: AtomicCount::new(0),
+            tick_millis: AtomicCount::new(50),
             running: AtomicBool::new(true),
         });
         let shared = watchdog.clone();
@@ -69,24 +79,26 @@ impl Watchdog {
     }
     /// The tick loop is about to run the tick due at `next`.
     fn tick_due(&self, next: Instant, tick: Duration) {
-        let nanos = next.saturating_duration_since(self.base).as_nanos();
-        self.next_nanos
-            .store(u64::try_from(nanos).unwrap_or(u64::MAX), Ordering::Relaxed);
-        let tick = u64::try_from(tick.as_nanos()).unwrap_or(u64::MAX);
-        self.tick_nanos.store(tick, Ordering::Relaxed);
+        let millis = next.saturating_duration_since(self.base).as_millis();
+        self.next_millis.store(
+            u64::try_from(millis).unwrap_or(u64::MAX) as _,
+            Ordering::Relaxed,
+        );
+        let tick = u64::try_from(tick.as_millis()).unwrap_or(u64::MAX);
+        self.tick_millis.store(tick as _, Ordering::Relaxed);
     }
     /// `ServerWatchdog.run`.
     fn run(&self, max: Duration) {
-        let max = u64::try_from(max.as_nanos()).unwrap_or(u64::MAX);
+        let max = u64::try_from(max.as_millis()).unwrap_or(u64::MAX);
         while self.running.load(Ordering::Relaxed) {
-            let next = self.next_nanos.load(Ordering::Relaxed);
-            let now = u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            let behind = now.saturating_sub(next);
+            let next = u64::from(self.next_millis.load(Ordering::Relaxed));
+            let now = u64::try_from(self.base.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let behind = now.wrapping_sub(next);
             if behind > max {
-                let took = format!("{:.2}", behind as f32 / 1e9);
+                let took = format!("{:.2}", behind as f32 / 1e3);
                 let should = format!(
                     "{:.2}",
-                    self.tick_nanos.load(Ordering::Relaxed) as f32 / 1e9
+                    self.tick_millis.load(Ordering::Relaxed) as f32 / 1e3
                 );
                 log_from(
                     "Server Watchdog",
@@ -123,8 +135,8 @@ impl Watchdog {
                 std::process::exit(1);
             }
             // Thread.sleep(nextTickTime + maxTickTime - now).
-            let wait = (next + max).saturating_sub(now).max(1_000_000);
-            std::thread::sleep(Duration::from_nanos(wait));
+            let wait = (next as u64 + max).saturating_sub(now as u64).max(1);
+            std::thread::sleep(Duration::from_millis(wait));
         }
     }
 }

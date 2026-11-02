@@ -25,9 +25,17 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicI64, AtomicU8, Ordering},
+        atomic::{self, AtomicU8, Ordering},
     },
 };
+
+/// 64-bit where the target has 64-bit atomics; a narrower counter wraps
+/// harmlessly and keeps targets without them (armv6k-nintendo-3ds)
+/// compiling.
+#[cfg(target_has_atomic = "64")]
+type AtomicCount = atomic::AtomicI64;
+#[cfg(not(target_has_atomic = "64"))]
+type AtomicCount = atomic::AtomicI32;
 
 struct Data {
     types: HashMap<String, Arc<MobType>>,
@@ -62,7 +70,7 @@ pub struct StructureMobFinalizer {
     data: OnceLock<Option<Data>>,
     /// The level's difficulty (0 peaceful to 3 hard) and overworld clock.
     difficulty: AtomicU8,
-    day_time: AtomicI64,
+    day_time: AtomicCount,
 }
 impl StructureMobFinalizer {
     pub fn new(root: PathBuf, dimension: &str) -> Self {
@@ -71,12 +79,12 @@ impl StructureMobFinalizer {
             dimension: dimension.to_owned(),
             data: OnceLock::new(),
             difficulty: AtomicU8::new(2),
-            day_time: AtomicI64::new(0),
+            day_time: AtomicCount::new(0),
         }
     }
     pub fn set_conditions(&self, difficulty: u8, day_time: i64) {
         self.difficulty.store(difficulty, Ordering::Relaxed);
-        self.day_time.store(day_time, Ordering::Relaxed);
+        self.day_time.store(day_time as _, Ordering::Relaxed);
     }
 }
 
@@ -270,7 +278,7 @@ impl StructureMobFinalizer {
         group: &mut Option<Group>,
     ) -> Option<Compound> {
         let base = self.difficulty.load(Ordering::Relaxed);
-        let day_time = self.day_time.load(Ordering::Relaxed);
+        let day_time = self.day_time.load(Ordering::Relaxed) as i64;
         let mut level = Level {
             data,
             biome,

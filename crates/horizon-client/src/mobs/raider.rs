@@ -62,10 +62,16 @@ pub struct State {
     pub pre_hurt_health: f32,
 }
 
-static HURT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 64-bit where the target has 64-bit atomics; a narrower counter wraps
+/// harmlessly and keeps targets without them (armv6k-nintendo-3ds) compiling.
+#[cfg(target_has_atomic = "64")]
+type AtomicCount = std::sync::atomic::AtomicU64;
+#[cfg(not(target_has_atomic = "64"))]
+type AtomicCount = std::sync::atomic::AtomicU32;
+static HURT_SEQ: AtomicCount = AtomicCount::new(0);
 /// A counter ordering the hurts of raiders across the game.
 pub fn next_hurt_seq() -> u64 {
-    HURT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    HURT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64 + 1
 }
 /// `Raider.hurtServer`: a raider in an active raid asks its raid to update
 /// the bar with the health it has before this hit.
