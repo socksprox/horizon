@@ -7,7 +7,19 @@ use horizon_world::{
     registry::{BlockRegistry, BlockStateId},
 };
 use serde_json::Value;
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{self, BufReader},
+    path::Path,
+    sync::Arc,
+};
+
+/// A JSON error naming the prepared file it came from, as
+/// `horizon_world::json_file::parse` does for a slice.
+fn named(path: &Path, e: serde_json::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display()))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RenderShape {
@@ -147,7 +159,7 @@ pub struct GameplayProjection {
 }
 
 impl GameplayProjection {
-    fn from_entry(entry: &decode::Entry<'_>, strings: &mut HashMap<String, Arc<str>>) -> Self {
+    fn from_entry(entry: &decode::Entry, strings: &mut HashMap<String, Arc<str>>) -> Self {
         fn intern(strings: &mut HashMap<String, Arc<str>>, value: &str) -> Arc<str> {
             if let Some(existing) = strings.get(value) {
                 return Arc::clone(existing);
@@ -286,15 +298,37 @@ impl BlockFacts {
         Ok(Self::load_with_callback(root, registry, behaviours, true, |_| Ok(()))?.0)
     }
 
-    /// `load_with_behaviour_json` with explicit `parallel` control. Targets
-    /// with a small heap (armv6k-nintendo-3ds) cannot afford the parallel
-    /// validation pass living beside the decode.
+    /// `load_with_behaviour_json` for small heaps (armv6k-nintendo-3ds):
+    /// the parallel validation pass cannot live beside the decode, and
+    /// the ~55 MB file cannot sit on the heap at all — both passes stream
+    /// off the filesystem and each decoded entry folds into the facts
+    /// table as it arrives, so the entry array is never resident either.
     pub fn load_with_behaviour_json_seq(
         root: &Path,
         registry: &BlockRegistry,
         behaviours: &Value,
     ) -> Result<Self> {
-        Ok(Self::load_with_callback(root, registry, behaviours, false, |_| Ok(()))?.0)
+        let path = root.join("gameplay-facts.json");
+        serde_json::from_reader::<_, decode::Validate>(BufReader::new(File::open(&path)?))
+            .map(drop)?;
+        let mut decode = Decode::new(registry, behaviours)?;
+        let mut shapes = decode::Shapes::default();
+        let mut present = false;
+        let mut deserializer =
+            serde_json::Deserializer::from_reader(BufReader::new(File::open(path)?));
+        serde::Deserializer::deserialize_any(
+            &mut deserializer,
+            decode::Streamed {
+                present: &mut present,
+                sink: |index: usize, entry: decode::Entry| {
+                    decode.entry_owned(&mut shapes, index, &entry)
+                },
+            },
+        )?;
+        if !present {
+            return Err("missing gameplay state facts".into());
+        }
+        decode.finish()
     }
 
     /// Build both tables from the same behaviour document and gameplay decoder.
@@ -315,21 +349,31 @@ impl BlockFacts {
         registry: &BlockRegistry,
         behaviours: &Value,
         parallel: bool,
-        callback: impl FnOnce(&[decode::Entry<'_>]) -> Result<T>,
+        callback: impl FnOnce(&[decode::Entry]) -> Result<T>,
     ) -> Result<(Self, T)> {
         let path = root.join("gameplay-facts.json");
+        if !parallel {
+            // Streamed validation keeps the file off the heap; the decode
+            // reads it a second time rather than retaining it.
+            serde_json::from_reader::<_, decode::Validate>(BufReader::new(File::open(&path)?))
+                .map_err(|e| named(&path, e))?;
+            return Self::decode_with_callback(
+                &path,
+                BufReader::new(File::open(&path)?),
+                registry,
+                behaviours,
+                callback,
+            );
+        }
         let bytes = horizon_world::json_file::read_bytes(&path)?;
         let validate =
             || horizon_world::json_file::parse::<decode::Validate>(&path, &bytes).map(drop);
-        if !parallel {
-            validate()?;
-            return Self::decode_with_callback(&path, &bytes, registry, behaviours, callback);
-        }
         // The validation pass (a third of the load) only reports errors: it
         // reads the file beside the decode, and its error still wins.
         std::thread::scope(|scope| {
             let validated = scope.spawn(validate);
-            let decoded = Self::decode_with_callback(&path, &bytes, registry, behaviours, callback);
+            let decoded =
+                Self::decode_with_callback(&path, &bytes[..], registry, behaviours, callback);
             validated
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
@@ -339,12 +383,13 @@ impl BlockFacts {
 
     fn decode_with_callback<T>(
         path: &Path,
-        bytes: &[u8],
+        reader: impl std::io::Read,
         registry: &BlockRegistry,
         behaviours: &Value,
-        callback: impl FnOnce(&[decode::Entry<'_>]) -> Result<T>,
+        callback: impl FnOnce(&[decode::Entry]) -> Result<T>,
     ) -> Result<(Self, T)> {
-        let raw: decode::Gameplay<'_> = horizon_world::json_file::parse(path, bytes)?;
+        let raw: decode::Gameplay =
+            serde_json::from_reader(reader).map_err(|e| named(path, e))?;
         let entries = raw
             .states
             .0
@@ -353,170 +398,13 @@ impl BlockFacts {
         if entries.len() != registry.len() {
             return Err("gameplay facts do not match the block registry".into());
         }
-        // Class chains and per-state behaviour flags exported from the actual block objects.
-        let behaviour_states = behaviours["states"]
-            .as_array()
-            .filter(|s| s.len() == registry.len())
-            .ok_or("block behaviour facts do not match the block registry")?;
-        let mut class_names: HashMap<String, Arc<str>> = HashMap::new();
-        let classes: HashMap<&str, Arc<[Arc<str>]>> = behaviours["blocks"]
-            .as_array()
-            .ok_or("missing block behaviour classes")?
-            .iter()
-            .filter_map(|b| {
-                let chain = b["class"]
-                    .as_array()?
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(|c| {
-                        class_names
-                            .entry(c.to_owned())
-                            .or_insert_with(|| Arc::from(c))
-                            .clone()
-                    });
-                Some((b["name"].as_str()?, chain.collect()))
-            })
-            .collect();
-        let woods = behaviours["blocks"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|b| {
-                b["class"]
-                    .as_array()
-                    .is_some_and(|chain| chain.iter().any(|c| c == "SignBlock"))
-            })
-            .filter_map(|b| {
-                Some((
-                    Arc::from(b["name"].as_str()?),
-                    Arc::from(b["fields"]["type"]["name"].as_str()?),
-                ))
-            })
-            .collect();
-        let mut names: HashMap<String, Arc<str>> = HashMap::new();
-        let mut intern = |s: &str| -> Arc<str> {
-            if let Some(name) = names.get(s) {
-                return name.clone();
-            }
-            let name: Arc<str> = Arc::from(s);
-            names.insert(s.to_owned(), name.clone());
-            name
-        };
+        let mut decode = Decode::new(registry, behaviours)?;
         let mut shapes = decode::Shapes::default();
-        let mut states = Vec::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {
-            let id = BlockStateId(index as u32);
-            if entry.id != Some(index as u64) {
-                return Err("gameplay facts are not in registry order".into());
-            }
-            let state = registry.state(id).ok_or("missing registry state")?;
-            let sound = &entry.sound;
-            let prop = |k: &str| state.properties.get(k).map(String::as_str);
-            let (fluid, fluid_level, fluid_falling) = match state.name.as_str() {
-                "minecraft:water" | "minecraft:lava" => {
-                    let level: u8 = prop("level").and_then(|v| v.parse().ok()).unwrap_or(0);
-                    let kind = if state.name == "minecraft:water" {
-                        Fluid::Water
-                    } else {
-                        Fluid::Lava
-                    };
-                    // LiquidBlock: level 0 is the source; 1..7 flowing; >=8 falling.
-                    if level == 0 {
-                        (kind, 8, false)
-                    } else if level >= 8 {
-                        (kind, 8, true)
-                    } else {
-                        (kind, 8 - level, false)
-                    }
-                }
-                "minecraft:bubble_column"
-                | "minecraft:kelp"
-                | "minecraft:kelp_plant"
-                | "minecraft:seagrass"
-                | "minecraft:tall_seagrass" => (Fluid::Water, 8, false),
-                _ if prop("waterlogged") == Some("true") => (Fluid::Water, 8, false),
-                _ => (Fluid::None, 0, false),
-            };
-            let air = matches!(
-                state.name.as_str(),
-                "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
-            );
-            let cube = move || {
-                if air {
-                    Vec::new()
-                } else {
-                    vec![[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]]
-                }
-            };
-            let edges = move || if air { Vec::new() } else { cube_edges() };
-            let outline = shapes.intern(entry.outline, cube)?;
-            let outline_edges = shapes.intern(entry.outline_edges, edges)?;
-            // The export holds MapColor.col; ids are positions in MAP_COLORS.
-            let col = entry.map_color.unwrap_or(0) as u32;
-            let map_color = if col == 0 {
-                0
-            } else {
-                MAP_COLORS.iter().position(|c| *c == col).unwrap_or(0) as u8
-            };
-            states.push(StateFacts {
-                map_color,
-                outline,
-                outline_edges,
-                name: intern(&state.name),
-                emission: entry.emission.as_f64().unwrap_or(0.0) as u8,
-                dampening: entry.dampening.as_f64().unwrap_or(0.0) as u8,
-                skylight_down: entry.skylight_down,
-                shape_occlusion: entry.shape_occlusion,
-                can_occlude: entry.can_occlude,
-                solid_render: entry.solid_render,
-                hardness: entry.hardness.as_f64().unwrap_or(0.0) as f32,
-                requires_tool: entry.requires_tool,
-                replaceable: entry.replaceable,
-                random_ticks: entry.random_ticks,
-                block_entity: entry.block_entity,
-                render_shape: match entry.render_shape.as_deref() {
-                    Some("INVISIBLE") => RenderShape::Invisible,
-                    Some("ENTITYBLOCK_ANIMATED") => RenderShape::Animated,
-                    _ => RenderShape::Model,
-                },
-                full_collision: entry.full_collision,
-                friction: entry.friction as f32,
-                explosion_resistance: entry.explosion_resistance as f32,
-                item: intern(entry.item.as_deref().unwrap_or("minecraft:air")),
-                sounds: Sounds {
-                    volume: sound.volume as f32,
-                    pitch: sound.pitch as f32,
-                    break_sound: intern(sound.r#break.id.as_deref().unwrap_or("")),
-                    step: intern(sound.step.id.as_deref().unwrap_or("")),
-                    place: intern(sound.place.id.as_deref().unwrap_or("")),
-                    hit: intern(sound.hit.id.as_deref().unwrap_or("")),
-                    fall: intern(sound.fall.id.as_deref().unwrap_or("")),
-                },
-                fluid,
-                fluid_level,
-                fluid_falling,
-                waterlogged: prop("waterlogged") == Some("true"),
-                random_offset: entry.offset,
-                outline_offset: entry.outline_offset.unwrap_or(entry.offset),
-                legacy_solid: behaviour_states[index][1].as_u64().unwrap_or(0) & 1 != 0,
-                sturdy_full: (behaviour_states[index][0].as_u64().unwrap_or(0) & 63) as u8,
-                classes: classes
-                    .get(state.name.as_str())
-                    .cloned()
-                    .ok_or("missing block behaviour class chain")?,
-            });
+            decode.entry_ref(&mut shapes, index, entry)?;
         }
         let extra = callback(entries)?;
-        Ok((
-            Self {
-                states,
-                air: registry
-                    .default_state("minecraft:air")
-                    .ok_or("missing air")?,
-                woods,
-            },
-            extra,
-        ))
+        Ok((decode.finish()?, extra))
     }
     /// A state the registry doesn't have (a server with mods we lack sent it)
     /// has air's facts.
@@ -538,7 +426,7 @@ impl BlockFacts {
     }
 }
 
-impl GameplayStateSource for decode::Entry<'_> {
+impl GameplayStateSource for decode::Entry {
     fn flag(&self, name: &str) -> bool {
         match name {
             "replaceable" => self.replaceable,
@@ -588,5 +476,256 @@ impl GameplayStateSource for decode::Entry<'_> {
             "fall" => self.sound.fall.id.as_deref().unwrap_or(""),
             _ => "",
         }
+    }
+}
+
+/// The per-load context `decode_with_callback`'s loop and
+/// `load_with_behaviour_json_seq`'s streamed rows share: the behaviour
+/// lookups (`behaviour_states`, `classes`), the interners (`names`, the
+/// `Shapes` the callers pass), and the growing `states` table.
+struct Decode<'a> {
+    registry: &'a BlockRegistry,
+    behaviour_states: &'a [Value],
+    classes: HashMap<&'a str, Arc<[Arc<str>]>>,
+    woods: HashMap<Arc<str>, Arc<str>>,
+    names: HashMap<String, Arc<str>>,
+    states: Vec<StateFacts>,
+}
+
+impl<'a> Decode<'a> {
+    /// Class chains and per-state behaviour flags exported from the actual
+    /// block objects; the per-row intern tables start empty.
+    fn new(registry: &'a BlockRegistry, behaviours: &'a Value) -> Result<Self> {
+        let behaviour_states = behaviours["states"]
+            .as_array()
+            .filter(|s| s.len() == registry.len())
+            .ok_or("block behaviour facts do not match the block registry")?;
+        let mut class_names: HashMap<String, Arc<str>> = HashMap::new();
+        let classes: HashMap<&str, Arc<[Arc<str>]>> = behaviours["blocks"]
+            .as_array()
+            .ok_or("missing block behaviour classes")?
+            .iter()
+            .filter_map(|b| {
+                let chain = b["class"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|c| {
+                        class_names
+                            .entry(c.to_owned())
+                            .or_insert_with(|| Arc::from(c))
+                            .clone()
+                    });
+                Some((b["name"].as_str()?, chain.collect()))
+            })
+            .collect();
+        let woods = behaviours["blocks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|b| {
+                b["class"]
+                    .as_array()
+                    .is_some_and(|chain| chain.iter().any(|c| c == "SignBlock"))
+            })
+            .filter_map(|b| {
+                Some((
+                    Arc::from(b["name"].as_str()?),
+                    Arc::from(b["fields"]["type"]["name"].as_str()?),
+                ))
+            })
+            .collect();
+        Ok(Self {
+            registry,
+            behaviour_states,
+            classes,
+            woods,
+            names: HashMap::new(),
+            states: Vec::with_capacity(registry.len()),
+        })
+    }
+    fn intern_str(&mut self, s: &str) -> Arc<str> {
+        if let Some(name) = self.names.get(s) {
+            return name.clone();
+        }
+        let name: Arc<str> = Arc::from(s);
+        self.names.insert(s.to_owned(), name.clone());
+        name
+    }
+    /// The air-aware outline fallbacks the `Shapes::intern*` calls take
+    /// when a row carries no explicit geometry.
+    fn outline_fallbacks(
+        &self,
+        index: usize,
+    ) -> (
+        impl FnOnce() -> Vec<[f64; 6]>,
+        impl FnOnce() -> Vec<[f64; 6]>,
+    ) {
+        let air = self
+            .registry
+            .state(BlockStateId(index as u32))
+            .is_some_and(|state| {
+                matches!(
+                    state.name.as_str(),
+                    "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air"
+                )
+            });
+        let cube = move || {
+            if air {
+                Vec::new()
+            } else {
+                vec![[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]]
+            }
+        };
+        let edges = move || if air { Vec::new() } else { cube_edges() };
+        (cube, edges)
+    }
+    /// One row of `states` for the collected decode: the entry's raw text
+    /// stays alive for the whole pass, so `Shapes::intern` can dedup on it.
+    fn entry_ref<'b>(
+        &mut self,
+        shapes: &mut decode::Shapes<'b>,
+        index: usize,
+        entry: &'b decode::Entry,
+    ) -> Result<()> {
+        let (cube, edges) = self.outline_fallbacks(index);
+        let outline = shapes.intern(entry.outline.as_deref(), cube)?;
+        let outline_edges = shapes.intern(entry.outline_edges.as_deref(), edges)?;
+        self.entry_facts(index, entry, outline, outline_edges)
+    }
+    /// One row for the streamed decode: the entry frees right after, so
+    /// only the value-level shape interning applies.
+    fn entry_owned(
+        &mut self,
+        shapes: &mut decode::Shapes<'_>,
+        index: usize,
+        entry: &decode::Entry,
+    ) -> Result<()> {
+        let (cube, edges) = self.outline_fallbacks(index);
+        let outline = shapes.intern_owned(entry.outline.as_deref(), cube)?;
+        let outline_edges = shapes.intern_owned(entry.outline_edges.as_deref(), edges)?;
+        self.entry_facts(index, entry, outline, outline_edges)
+    }
+    /// `entry`'s `StateFacts` row, pushed in registry order.
+    fn entry_facts(
+        &mut self,
+        index: usize,
+        entry: &decode::Entry,
+        outline: Arc<[[f64; 6]]>,
+        outline_edges: Arc<[[f64; 6]]>,
+    ) -> Result<()> {
+        if index >= self.registry.len() {
+            return Err("gameplay facts do not match the block registry".into());
+        }
+        let id = BlockStateId(index as u32);
+        if entry.id != Some(index as u64) {
+            return Err("gameplay facts are not in registry order".into());
+        }
+        let registry = self.registry;
+        let state = registry.state(id).ok_or("missing registry state")?;
+        let sound = &entry.sound;
+        let prop = |k: &str| state.properties.get(k).map(String::as_str);
+        let (fluid, fluid_level, fluid_falling) = match state.name.as_str() {
+            "minecraft:water" | "minecraft:lava" => {
+                let level: u8 = prop("level").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let kind = if state.name == "minecraft:water" {
+                    Fluid::Water
+                } else {
+                    Fluid::Lava
+                };
+                // LiquidBlock: level 0 is the source; 1..7 flowing; >=8 falling.
+                if level == 0 {
+                    (kind, 8, false)
+                } else if level >= 8 {
+                    (kind, 8, true)
+                } else {
+                    (kind, 8 - level, false)
+                }
+            }
+            "minecraft:bubble_column"
+            | "minecraft:kelp"
+            | "minecraft:kelp_plant"
+            | "minecraft:seagrass"
+            | "minecraft:tall_seagrass" => (Fluid::Water, 8, false),
+            _ if prop("waterlogged") == Some("true") => (Fluid::Water, 8, false),
+            _ => (Fluid::None, 0, false),
+        };
+        // The export holds MapColor.col; ids are positions in MAP_COLORS.
+        let col = entry.map_color.unwrap_or(0) as u32;
+        let map_color = if col == 0 {
+            0
+        } else {
+            MAP_COLORS.iter().position(|c| *c == col).unwrap_or(0) as u8
+        };
+        let name = self.intern_str(&state.name);
+        let item = self.intern_str(entry.item.as_deref().unwrap_or("minecraft:air"));
+        let break_sound = self.intern_str(sound.r#break.id.as_deref().unwrap_or(""));
+        let step = self.intern_str(sound.step.id.as_deref().unwrap_or(""));
+        let place = self.intern_str(sound.place.id.as_deref().unwrap_or(""));
+        let hit = self.intern_str(sound.hit.id.as_deref().unwrap_or(""));
+        let fall = self.intern_str(sound.fall.id.as_deref().unwrap_or(""));
+        let classes = self
+            .classes
+            .get(state.name.as_str())
+            .cloned()
+            .ok_or("missing block behaviour class chain")?;
+        self.states.push(StateFacts {
+            map_color,
+            outline,
+            outline_edges,
+            name,
+            emission: entry.emission.as_f64().unwrap_or(0.0) as u8,
+            dampening: entry.dampening.as_f64().unwrap_or(0.0) as u8,
+            skylight_down: entry.skylight_down,
+            shape_occlusion: entry.shape_occlusion,
+            can_occlude: entry.can_occlude,
+            solid_render: entry.solid_render,
+            hardness: entry.hardness.as_f64().unwrap_or(0.0) as f32,
+            requires_tool: entry.requires_tool,
+            replaceable: entry.replaceable,
+            random_ticks: entry.random_ticks,
+            block_entity: entry.block_entity,
+            render_shape: match entry.render_shape.as_deref() {
+                Some("INVISIBLE") => RenderShape::Invisible,
+                Some("ENTITYBLOCK_ANIMATED") => RenderShape::Animated,
+                _ => RenderShape::Model,
+            },
+            full_collision: entry.full_collision,
+            friction: entry.friction as f32,
+            explosion_resistance: entry.explosion_resistance as f32,
+            item,
+            sounds: Sounds {
+                volume: sound.volume as f32,
+                pitch: sound.pitch as f32,
+                break_sound,
+                step,
+                place,
+                hit,
+                fall,
+            },
+            fluid,
+            fluid_level,
+            fluid_falling,
+            waterlogged: prop("waterlogged") == Some("true"),
+            random_offset: entry.offset,
+            outline_offset: entry.outline_offset.unwrap_or(entry.offset),
+            legacy_solid: self.behaviour_states[index][1].as_u64().unwrap_or(0) & 1 != 0,
+            sturdy_full: (self.behaviour_states[index][0].as_u64().unwrap_or(0) & 63) as u8,
+            classes,
+        });
+        Ok(())
+    }
+    fn finish(self) -> Result<BlockFacts> {
+        if self.states.len() != self.registry.len() {
+            return Err("gameplay facts do not match the block registry".into());
+        }
+        Ok(BlockFacts {
+            states: self.states,
+            air: self
+                .registry
+                .default_state("minecraft:air")
+                .ok_or("missing air")?,
+            woods: self.woods,
+        })
     }
 }

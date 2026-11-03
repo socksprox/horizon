@@ -153,6 +153,23 @@ pub struct AnimationSample {
     pub interpolation_millis: u32,
 }
 impl AnimationClip {
+    /// Rebuild a clip from a baked bundle's parts (the prepare-time path —
+    /// `from_baked`, like `HudAtlas`'s): the `(frame, ticks)` sequence, its
+    /// cumulative `ends`, the `duration` and the interpolate flag, exactly
+    /// as [`AnimationMetadata::clip`] computed them. Plain field assignment.
+    pub fn from_baked(
+        sequence: Vec<(u32, u32)>,
+        ends: Vec<u64>,
+        duration: u64,
+        interpolate: bool,
+    ) -> Self {
+        Self {
+            sequence,
+            ends,
+            duration,
+            interpolate,
+        }
+    }
     pub fn sequence(&self) -> &[(u32, u32)] {
         &self.sequence
     }

@@ -57,7 +57,77 @@ pub struct LightTables {
     /// `blocked(type_a, type_b, direction)` as a bit per direction.
     block_masks: Vec<u8>,
 }
+/// `LightTables`' cells and derived caches as owned plain data, for
+/// skyline-prepare's baked render bundle: the 3DS loader's `from_baked`
+/// takes the same parts and skips the occlusion-shape joins entirely.
+pub struct LightParts {
+    /// Per state: dampening, emission and its occlusion faces.
+    pub cells: Vec<LightCell>,
+    /// `faceShapeOccludes(a, b)` for every pair of distinct face shapes.
+    pub occludes: Vec<bool>,
+    /// The distinct face shape count (`occludes` is `faces`²).
+    pub faces: usize,
+    /// The distinct `(shaped, faces)` cell configuration count.
+    pub types: usize,
+    /// Per state: `emission << 16 | type << 4 | dampening`.
+    pub info: Vec<u32>,
+    /// `blocked(type_a, type_b, direction)` as a bit per direction.
+    pub block_masks: Vec<u8>,
+}
+/// A light `Cell` as plain data.
+#[derive(Clone, Copy)]
+pub struct LightCell {
+    pub dampening: u8,
+    pub emission: u8,
+    /// Any face is non-empty (`!isEmptyShape`), so edges need the face table.
+    pub shaped: bool,
+    pub faces: [u16; 6],
+}
 impl LightTables {
+    /// The table's parts for skyline-prepare's baked render bundle.
+    pub fn parts(&self) -> LightParts {
+        LightParts {
+            cells: self
+                .cells
+                .iter()
+                .map(|c| LightCell {
+                    dampening: c.dampening,
+                    emission: c.emission,
+                    shaped: c.shaped,
+                    faces: c.faces,
+                })
+                .collect(),
+            occludes: self.occludes.clone(),
+            faces: self.faces,
+            types: self.types,
+            info: self.info.clone(),
+            block_masks: self.block_masks.clone(),
+        }
+    }
+    /// Rebuild the tables from the bundle's serialized `parts` — the reader
+    /// side (`from_baked`, like `HudAtlas`'s). The derived caches come with
+    /// the bake, so unlike `from_parts` nothing re-derives here.
+    pub fn from_baked(parts: LightParts) -> Self {
+        Self {
+            cells: parts
+                .cells
+                .into_iter()
+                .map(|c| Cell {
+                    dampening: c.dampening,
+                    emission: c.emission,
+                    shaped: c.shaped,
+                    faces: c.faces,
+                })
+                .collect(),
+            occludes: parts.occludes,
+            faces: parts.faces,
+            types: parts.types,
+            // `info`'s low 16 bits: derived, so the bake need not carry it.
+            packed: parts.info.iter().map(|&i| i as u16).collect(),
+            info: parts.info,
+            block_masks: parts.block_masks,
+        }
+    }
     /// Dampening and emission only: every occlusion face is empty.
     pub fn new(facts: &BlockFacts) -> Self {
         let mut tables = Self {

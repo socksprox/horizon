@@ -3,7 +3,7 @@
 //! borrowed until it is interned, rather than allocating a JSON tree for every state.
 use serde::{
     Deserialize, Deserializer,
-    de::{MapAccess, SeqAccess, Visitor},
+    de::{DeserializeSeed, MapAccess, SeqAccess, Visitor},
 };
 use serde_json::{Value, value::RawValue};
 use std::{
@@ -80,16 +80,15 @@ macro_rules! read_field {
     };
 }
 macro_rules! object {
-    ($name:ident<$life:lifetime> { $($field:ident: $ty:ty = $default:expr => $kind:ident $(($convert:expr))?),* $(,)? }) => {
-        pub(super) struct $name<$life> {
+    ($name:ident { $($field:ident: $ty:ty = $default:expr => $kind:ident $(($convert:expr))?),* $(,)? }) => {
+        pub(super) struct $name {
             $(pub $field: $ty,)*
-            marker: PhantomData<&$life ()>,
         }
-        impl Default for $name<'_> {
-            fn default() -> Self { Self { $($field: $default,)* marker: PhantomData } }
+        impl Default for $name {
+            fn default() -> Self { Self { $($field: $default,)* } }
         }
-        impl<$life> Container<$life> for $name<$life> {
-            fn map<A: MapAccess<$life>>(mut map: A) -> Result<Self, A::Error> {
+        impl<'de> Container<'de> for $name {
+            fn map<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
                 #[derive(Deserialize)]
                 #[allow(non_camel_case_types)]
                 #[serde(field_identifier)]
@@ -104,8 +103,8 @@ macro_rules! object {
                 Ok(result)
             }
         }
-        impl<$life> Deserialize<$life> for $name<$life> {
-            fn deserialize<D: Deserializer<$life>>(d: D) -> Result<Self, D::Error> { container(d) }
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> { container(d) }
         }
     };
 }
@@ -127,8 +126,8 @@ fn text(v: Value) -> Option<String> {
 }
 
 #[derive(Default)]
-pub(super) struct Entries<'a>(pub Option<Vec<Entry<'a>>>);
-impl<'de> Container<'de> for Entries<'de> {
+pub(super) struct Entries(pub Option<Vec<Entry>>);
+impl<'de> Container<'de> for Entries {
     fn seq<A: SeqAccess<'de>>(mut seq: A) -> Result<Self, A::Error> {
         let mut entries = Vec::new();
         while let Some(entry) = seq.next_element()? {
@@ -137,23 +136,23 @@ impl<'de> Container<'de> for Entries<'de> {
         Ok(Self(Some(entries)))
     }
 }
-impl<'de> Deserialize<'de> for Entries<'de> {
+impl<'de> Deserialize<'de> for Entries {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         container(d)
     }
 }
-object!(Gameplay<'a> { states: Entries<'a> = Entries::default() => typed });
-object!(SoundId<'a> { id: Option<String> = None => value(text) });
-object!(Sound<'a> {
+object!(Gameplay { states: Entries = Entries::default() => typed });
+object!(SoundId { id: Option<String> = None => value(text) });
+object!(Sound {
     volume: f64 = 1.0 => value(|v: Value| v.as_f64().unwrap_or(1.0)),
     pitch: f64 = 1.0 => value(|v: Value| v.as_f64().unwrap_or(1.0)),
-    r#break: SoundId<'a> = SoundId::default() => typed,
-    step: SoundId<'a> = SoundId::default() => typed,
-    place: SoundId<'a> = SoundId::default() => typed,
-    hit: SoundId<'a> = SoundId::default() => typed,
-    fall: SoundId<'a> = SoundId::default() => typed,
+    r#break: SoundId = SoundId::default() => typed,
+    step: SoundId = SoundId::default() => typed,
+    place: SoundId = SoundId::default() => typed,
+    hit: SoundId = SoundId::default() => typed,
+    fall: SoundId = SoundId::default() => typed,
 });
-object!(Entry<'a> {
+object!(Entry {
     id: Option<u64> = None => value(unsigned),
     emission: Value = Value::Null => typed,
     dampening: Value = Value::Null => typed,
@@ -174,12 +173,14 @@ object!(Entry<'a> {
     friction: f64 = 0.0 => value(number),
     explosion_resistance: f64 = 0.0 => value(number),
     item: Option<String> = None => value(text),
-    sound: Sound<'a> = Sound::default() => typed,
+    sound: Sound = Sound::default() => typed,
     offset: bool = false => value(flag),
     outline_offset: Option<bool> = None => value(|v: Value| v.as_bool()),
     map_color: Option<u64> = None => value(unsigned),
-    outline: Option<&'a RawValue> = None => typed,
-    outline_edges: Option<&'a RawValue> = None => typed,
+    // Owned raw text (each entry carries its own small copy): the file's
+    // bytes are never mapped, so both decode passes can stream readers.
+    outline: Option<Box<RawValue>> = None => typed,
+    outline_edges: Option<Box<RawValue>> = None => typed,
 });
 
 // Match Value::to_string identity without serializing: integer/float spelling is
@@ -261,7 +262,32 @@ impl<'a> Shapes<'a> {
         if !value.is_array() {
             return Ok(fallback().into());
         }
-        let id = match self.canonical.entry(ShapeKey(value)) {
+        let id = self.canonical(value);
+        self.raw.insert(raw.get(), id);
+        Ok(self.values[id].clone())
+    }
+    /// `intern` for entries whose raw text is dropped with the row (the
+    /// streamed sequential load): the raw-text table would have to borrow
+    /// a soon-dead copy, so only the value-level table dedups here.
+    pub fn intern_owned(
+        &mut self,
+        raw: Option<&RawValue>,
+        fallback: impl FnOnce() -> Vec<[f64; 6]>,
+    ) -> crate::Result<Arc<[[f64; 6]]>> {
+        let Some(raw) = raw else {
+            return Ok(fallback().into());
+        };
+        let value: Value = serde_json::from_str(raw.get())?;
+        if !value.is_array() {
+            return Ok(fallback().into());
+        }
+        let id = self.canonical(value);
+        Ok(self.values[id].clone())
+    }
+    /// The `canonical` map's lookup-or-insert: shape identity decides, so
+    /// differently-spelled copies of one outline share the `Arc`.
+    fn canonical(&mut self, value: Value) -> usize {
+        match self.canonical.entry(ShapeKey(value)) {
             MapEntry::Occupied(entry) => *entry.get(),
             MapEntry::Vacant(entry) => {
                 let shape = entry
@@ -282,9 +308,122 @@ impl<'a> Shapes<'a> {
                 entry.insert(id);
                 id
             }
-        };
-        self.raw.insert(raw.get(), id);
-        Ok(self.values[id].clone())
+        }
+    }
+}
+
+/// `Gameplay`'s `{"states": [...]}` visited row by row: each `Entry` goes
+/// to `sink` and frees at once, so the streamed sequential load never
+/// holds the decoded array. `present` becomes true only when a real
+/// states array was visited — `Gameplay`'s missing-vs-empty split, kept
+/// so the caller reports `missing gameplay state facts` the same way.
+pub(super) struct Streamed<'p, S> {
+    pub present: &'p mut bool,
+    pub sink: S,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier)]
+enum StatesKey {
+    states,
+    #[serde(other)]
+    other,
+}
+
+impl<'de, S, E> Visitor<'de> for Streamed<'_, S>
+where
+    S: FnMut(usize, Entry) -> Result<(), E>,
+    E: fmt::Display,
+{
+    type Value = ();
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("the gameplay facts document")
+    }
+    fn visit_map<A: MapAccess<'de>>(mut self, mut map: A) -> Result<Self::Value, A::Error> {
+        while let Some(key) = map.next_key::<StatesKey>()? {
+            match key {
+                StatesKey::states => map.next_value_seed(StatesSeed {
+                    present: &mut *self.present,
+                    sink: &mut self.sink,
+                })?,
+                StatesKey::other => {
+                    map.next_value::<Validate>()?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+struct StatesSeed<'p, 's, S> {
+    present: &'p mut bool,
+    sink: &'s mut S,
+}
+impl<'de, S, E> DeserializeSeed<'de> for StatesSeed<'_, '_, S>
+where
+    S: FnMut(usize, Entry) -> Result<(), E>,
+    E: fmt::Display,
+{
+    type Value = ();
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_any(StatesVisitor {
+            present: self.present,
+            sink: self.sink,
+            index: 0,
+        })
+    }
+}
+
+struct StatesVisitor<'p, 's, S> {
+    present: &'p mut bool,
+    sink: &'s mut S,
+    index: usize,
+}
+impl<'de, S, E> Visitor<'de> for StatesVisitor<'_, '_, S>
+where
+    S: FnMut(usize, Entry) -> Result<(), E>,
+    E: fmt::Display,
+{
+    type Value = ();
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("the states array")
+    }
+    fn visit_seq<A: SeqAccess<'de>>(mut self, mut seq: A) -> Result<Self::Value, A::Error> {
+        *self.present = true;
+        while let Some(entry) = seq.next_element::<Entry>()? {
+            (self.sink)(self.index, entry).map_err(serde::de::Error::custom)?;
+            self.index += 1;
+        }
+        Ok(())
+    }
+    /// Anything that is not an array means "no facts", like `Entries`'s
+    /// default — the caller's `present` check reports it the same way.
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        while map.next_key::<serde::de::IgnoredAny>()?.is_some() {
+            map.next_value::<Validate>()?;
+        }
+        Ok(())
+    }
+    fn visit_unit<E2: serde::de::Error>(self) -> Result<Self::Value, E2> {
+        Ok(())
+    }
+    fn visit_bool<E2: serde::de::Error>(self, _: bool) -> Result<Self::Value, E2> {
+        Ok(())
+    }
+    fn visit_i64<E2: serde::de::Error>(self, _: i64) -> Result<Self::Value, E2> {
+        Ok(())
+    }
+    fn visit_u64<E2: serde::de::Error>(self, _: u64) -> Result<Self::Value, E2> {
+        Ok(())
+    }
+    fn visit_f64<E2: serde::de::Error>(self, _: f64) -> Result<Self::Value, E2> {
+        Ok(())
+    }
+    fn visit_str<E2: serde::de::Error>(self, _: &str) -> Result<Self::Value, E2> {
+        Ok(())
+    }
+    fn visit_none<E2: serde::de::Error>(self) -> Result<Self::Value, E2> {
+        Ok(())
     }
 }
 

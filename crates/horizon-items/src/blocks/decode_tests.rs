@@ -83,7 +83,7 @@ fn typed_fields_keep_defaults_duplicates_and_wrong_type_behavior() -> crate::Res
         "hardness":-0.0,"skylight_down":true,"offset":true,"outline_offset":"true",
         "item":42,"render_shape":false,"sound":{"volume":null,"pitch":2,"break":{"id":"a\u0062"},
         "step":false,"hit":{"id":2}},"outline":[[0,1]],"unknown":{"nested":true}}]}"#;
-    let parsed: Gameplay<'_> = serde_json::from_str(input)?;
+    let parsed: Gameplay = serde_json::from_str(input)?;
     let entries = parsed.states.0.unwrap();
     assert_eq!(entries[0].id, None);
     assert_eq!(entries[1].id, None);
@@ -101,7 +101,7 @@ fn typed_fields_keep_defaults_duplicates_and_wrong_type_behavior() -> crate::Res
     assert_eq!(e.sound.hit.id, None);
     assert_eq!(e.outline.unwrap().get(), "[[0,1]]");
     for input in ["null", "[]", "{}", r#"{"states":null}"#, r#"{"states":{}}"#] {
-        let parsed: Gameplay<'_> = serde_json::from_str(input)?;
+        let parsed: Gameplay = serde_json::from_str(input)?;
         assert!(parsed.states.0.is_none());
     }
     for input in [
@@ -111,7 +111,7 @@ fn typed_fields_keep_defaults_duplicates_and_wrong_type_behavior() -> crate::Res
         r#"{"unknown":1e400}"#,
     ] {
         let before = serde_json::from_str::<Value>(input).err().unwrap();
-        let after = serde_json::from_str::<Gameplay<'_>>(input).err().unwrap();
+        let after = serde_json::from_str::<Gameplay>(input).err().unwrap();
         assert_eq!(before.classify(), after.classify());
     }
     Ok(())

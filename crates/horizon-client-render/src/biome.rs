@@ -309,6 +309,34 @@ impl Biomes {
             info_noise: SimplexNoise::with_skipped_offsets(&mut LegacyRandom::new(2345), true),
         })
     }
+    /// Rebuild the table from a baked bundle's `list` and colormaps — the
+    /// reader side (`from_baked`, like `HudAtlas`'s): `index` re-derives
+    /// from the names, `info_noise` seeds exactly as `load`, `builtin` is
+    /// the same list and `packs` starts empty.
+    pub fn from_baked(
+        list: Vec<BiomeInfo>,
+        colormap_grass: Vec<u32>,
+        colormap_foliage: Vec<u32>,
+        colormap_dry: Vec<u32>,
+    ) -> Self {
+        let index = list
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.name.clone(), i as u16))
+            .collect();
+        Self {
+            builtin: Arc::new(list.clone()),
+            list,
+            index,
+            colormaps: Arc::new(Colormaps {
+                grass: colormap_grass,
+                foliage: colormap_foliage,
+                dry: colormap_dry,
+            }),
+            packs: BTreeMap::new(),
+            info_noise: SimplexNoise::with_skipped_offsets(&mut LegacyRandom::new(2345), true),
+        }
+    }
     /// The built-in biomes with a world's data packs' biome files (id →
     /// JSON) over them, as `RegistryDataLoader` builds the registry: a file
     /// for a built-in biome replaces it, keeping its id, and new biomes join

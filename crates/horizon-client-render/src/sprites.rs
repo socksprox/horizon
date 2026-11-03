@@ -69,6 +69,22 @@ impl SpriteAnimation {
     pub fn frame_count(&self) -> usize {
         self.frames.len()
     }
+    /// The animation's clip, for skyline-prepare's baked render bundle.
+    pub fn clip(&self) -> &AnimationClip {
+        &self.clip
+    }
+    /// Rebuild an animation from the same bundle's parts — the reader side
+    /// (`from_baked`, like `HudAtlas`'s): the sprite layer, its
+    /// native-resolution frames and the clip. Plain field assignment.
+    pub fn from_baked(layer: u32, frames: Vec<Vec<u8>>, clip: AnimationClip) -> Self {
+        Self {
+            layer,
+            frames: Arc::new(frames),
+            clip: Arc::new(clip),
+            // No LabPBR maps in a baked bundle.
+            materials: [None, None],
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

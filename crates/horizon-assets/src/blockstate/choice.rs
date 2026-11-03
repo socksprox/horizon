@@ -4,7 +4,7 @@ use crate::json::{Result, error};
 use horizon_core::random::RandomSource;
 
 #[derive(Clone, Debug)]
-enum Choice<T> {
+pub enum Choice<T> {
     Single(T),
     Weighted {
         variants: Vec<T>,
@@ -101,6 +101,21 @@ impl CompiledChoices {
     }
 }
 impl<T> CompiledChoices<T> {
+    /// The compiled variant roots and multipart selectors, for
+    /// skyline-prepare's baked render bundle (the 3DS port serializes them
+    /// instead of re-binding blockstate definitions on device).
+    pub fn parts(&self) -> (&[Choice<T>], &[Choice<T>]) {
+        (&self.variants, &self.multipart)
+    }
+    /// Rebuild choices from baked rows — the same bundle's reader side
+    /// (`from_baked`, like `HudAtlas`'s): plain field assignment, no
+    /// `BlockStateDefinition` to compile.
+    pub fn from_baked(variants: Vec<Choice<T>>, multipart: Vec<Choice<T>>) -> Self {
+        Self {
+            variants,
+            multipart,
+        }
+    }
     /// The same choices, with `f` of each variant in its place.
     pub fn map<U>(&self, mut f: impl FnMut(&T) -> U) -> CompiledChoices<U> {
         CompiledChoices {

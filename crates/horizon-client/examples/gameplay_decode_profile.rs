@@ -25,7 +25,7 @@ fn main() -> Result<()> {
         let parsed: decode::Validate = serde_json::from_slice(&bytes)?;
         black_box(parsed);
     } else {
-        let parsed: decode::Gameplay<'_> = serde_json::from_slice(&bytes)?;
+        let parsed: decode::Gameplay = serde_json::from_slice(&bytes)?;
         black_box(parsed);
     }
     println!("phase_ms={:.3}", started.elapsed().as_secs_f64() * 1000.0);

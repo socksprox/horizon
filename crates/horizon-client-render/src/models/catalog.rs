@@ -62,6 +62,19 @@ pub struct StateModels {
     /// Standalone models by id: their index in `baked`.
     standalone: BTreeMap<String, u32>,
 }
+/// The catalog's tables as shared borrows, for skyline-prepare's baked
+/// render bundle (the 3DS loader rebuilds an identical catalog from their
+/// serialized form instead of re-binding and re-baking on device).
+pub struct CatalogParts<'a> {
+    /// Each definition's choices, a variant standing as its index in `baked`.
+    pub choices: &'a [CompiledChoices<u32>],
+    /// By state id: its definition in `choices` and the models it selects.
+    pub states: &'a [Option<(usize, SelectedModels)>],
+    /// Every transformed model once, with the variant it was baked from.
+    pub baked: &'a [(Variant, BakedModel)],
+    /// Standalone models by id: their index in `baked`.
+    pub standalone: &'a BTreeMap<String, u32>,
+}
 fn key(variant: &Variant) -> VariantKey {
     (variant.model.clone(), variant.rotations, variant.uv_lock)
 }
@@ -418,6 +431,42 @@ impl StateModels {
             }
         }
         Ok(())
+    }
+    /// The catalog's tables, for skyline-prepare's baked render bundle.
+    pub fn parts(&self) -> CatalogParts<'_> {
+        CatalogParts {
+            choices: &self.choices,
+            states: &self.states,
+            baked: &self.baked,
+            standalone: &self.standalone,
+        }
+    }
+    /// Rebuild the catalog from the bundle's serialized tables — the reader
+    /// side (`from_baked`, like `HudAtlas`'s): choices already compiled to
+    /// `baked` indices, per-state selections, the deduplicated baked models
+    /// and the standalone ids. Plain field assignment, no binding or baking.
+    pub fn from_baked(
+        choices: Vec<CompiledChoices<u32>>,
+        states: Vec<Option<(usize, SelectedModels)>>,
+        baked: Vec<(Variant, BakedModel)>,
+        standalone: BTreeMap<String, u32>,
+    ) -> Self {
+        // Derived from `choices` and `states`, as `new` derives it.
+        let single_models = states
+            .iter()
+            .map(|state| {
+                let (choice, selected) = state.as_ref()?;
+                choices[*choice].single_variant(selected).copied()
+            })
+            .collect();
+        Self {
+            choices,
+            bounds: OnceLock::new(),
+            states,
+            single_models,
+            baked,
+            standalone,
+        }
     }
     /// Every baked model with the variant it was baked from, to change its faces.
     pub fn models_mut(&mut self) -> impl Iterator<Item = (&Variant, &mut BakedModel)> {
