@@ -45,7 +45,7 @@ use crate::{
     heightmap::{HeightmapState, HeightmapType},
     registry::BlockStateId,
 };
-use horizon_core::random::{WorldgenRandom, XoroshiroRandom};
+use horizon_core::random::{LegacyRandom, WorldgenRandom, XoroshiroRandom};
 use horizon_core::{
     biome::obfuscate_seed,
     geometry::{Axis, Direction, VoxelShape},
@@ -600,6 +600,115 @@ impl Decoration {
             .set_generation_stage(PreLightChunkStage::Features);
         region[4].set_decorated();
         Ok(stats)
+    }
+    /// `MinecraftServer.setInitialSpawn`'s bonus chest over the decorated
+    /// region — skyline places it into the proto chunks before they
+    /// columnize, where vanilla runs it on the already-loaded spawn chunk.
+    /// `BonusChestFeature.place` unchanged against `decorate`'s WorldGenRegion
+    /// view: the shuffled 16×16 walk over `origin`'s chunk, the chest (its
+    /// loot table and seed go to the chunk's block entities) and a torch per
+    /// side that holds one. `level_random` stands in for `level.getRandom()`;
+    /// `random` is the feature's (the same source in vanilla).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn place_bonus_chest(
+        &self,
+        data: &Arc<GeneratorData>,
+        seed: i64,
+        generation: WorldGenerationContext,
+        region: &mut [ProtoChunk; 9],
+        origin: [i32; 3],
+        level_random: &mut dyn super::structure::legacy::PieceRandom,
+        random: &mut LegacyRandom,
+    ) -> Result<bool, GeneratorError> {
+        let center = region[4].position();
+        for (i, chunk) in region.iter().enumerate() {
+            let expected = ChunkPos::new(
+                center.x.wrapping_add(i as i32 % 3 - 1),
+                center.z.wrapping_add(i as i32 / 3 - 1),
+            );
+            if chunk.position() != expected {
+                return Err(resource("decoration region is not a 3×3 neighborhood"));
+            }
+        }
+        // The region-to-`World` swap is `decorate`'s, minus the feature plan.
+        let mut chunks = Vec::with_capacity(9);
+        let mut biomes = Vec::with_capacity(9);
+        let (min_y, height) = (region[4].terrain.min_y(), region[4].terrain.height());
+        for chunk in region.iter_mut() {
+            let empty = super::terrain::TerrainChunk::new(
+                chunk.position(),
+                min_y,
+                16,
+                data.registry(),
+                data.block_states().clone(),
+            )
+            .map_err(|e| resource(e.to_string()))?;
+            chunks.push(std::mem::replace(&mut chunk.terrain, empty));
+            biomes.push(chunk.biomes().clone());
+        }
+        let terrain = TerrainRegion::new(chunks, generation)
+            .and_then(|region| region.with_block_bindings(&self.bindings))
+            .map(|region| region.with_world_seed(seed));
+        let terrain = match terrain {
+            Ok(terrain) => terrain,
+            Err(e) => return Err(resource(e.to_string())),
+        };
+        let mut block_entities = Vec::new();
+        for chunk in region.iter_mut() {
+            block_entities.append(&mut chunk.block_entities);
+        }
+        // The chest draws no biome or temperature lookups, but the world's
+        // caches must exist.
+        let mut temperatures: Vec<BiomeTemperature> = data
+            .temperatures
+            .iter()
+            .map(|s| BiomeTemperature::new(*s))
+            .collect();
+        let mut world = World {
+            block_entities,
+            entities: Vec::new(),
+            level_random,
+            structure_mobs: None,
+            starts: region[4].structure_starts.clone(),
+            biome_names: data.biome_names(),
+            blocks: data
+                .feature_resources
+                .as_ref()
+                .and_then(|r| r.blocks.as_ref()),
+            region: terrain,
+            biomes: BiomeRegion::new(biomes, obfuscate_seed(seed))
+                .map_err(|e| resource(e.to_string()))?,
+            zone: GenerationWriteZone::new(center, 1),
+            center,
+            uniform_biomes: vec![UNKNOWN_BIOME; 9 * (height / 16).max(0) as usize],
+            biome_quarts: region[4].biomes().quart_range(),
+            decoration: self,
+            temperatures: &mut temperatures,
+            behaviours: data.behaviours.as_deref(),
+            build: (min_y, min_y + height),
+            shape_ticks: std::cell::RefCell::new(crate::level::Ticks::new(0)),
+        };
+        let feature = super::bonus_chest::BonusChestFeature::new(&self.bindings)
+            .map_err(|e| resource(e.to_string()))?;
+        let result = feature
+            .place(&mut world, random, origin)
+            .map_err(|e| GeneratorError::Stage("bonus chest", e.to_string()));
+        // `decorate`'s write-backs: the loot-table block entity and the
+        // chest/torch blocks reach the proto chunks either way.
+        for (pos, nbt) in std::mem::take(&mut world.block_entities) {
+            let index = ((pos[2] >> 4).wrapping_sub(center.z) + 1) * 3
+                + (pos[0] >> 4).wrapping_sub(center.x)
+                + 1;
+            if let Some(chunk) = usize::try_from(index).ok().and_then(|i| region.get_mut(i)) {
+                chunk.block_entities.push((pos, nbt));
+            }
+        }
+        for terrain in world.region.into_chunks() {
+            let p = terrain.position();
+            let index = (p.z.wrapping_sub(center.z) + 1) * 3 + p.x.wrapping_sub(center.x) + 1;
+            region[index as usize].terrain = terrain;
+        }
+        result
     }
 }
 

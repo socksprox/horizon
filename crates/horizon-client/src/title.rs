@@ -19,7 +19,9 @@ mod buffet;
 mod confirm_experiments;
 mod create_world;
 mod experiments;
-mod flat;
+// Skyline mounts this module in its menus crate and names
+// `crate::title::flat::FlatSettings` across crates.
+pub mod flat;
 mod onboarding;
 #[cfg(test)]
 mod tests;

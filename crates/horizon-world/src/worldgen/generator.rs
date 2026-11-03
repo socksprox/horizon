@@ -184,7 +184,9 @@ pub struct GeneratorData {
     biome_names: Vec<Arc<str>>,
     biome_ids: BTreeMap<String, BiomeId>,
     biome_json: Vec<String>,
-    temperatures: Vec<BiomeTemperatureSettings>,
+    /// Per-biome temperature settings, seeding `WorkerState.temperatures`
+    /// (and the same cache `place_bonus_chest`'s world borrows).
+    pub(super) temperatures: Vec<BiomeTemperatureSettings>,
     biome_carvers: Vec<Vec<Arc<WorldCarver>>>,
     carving_blocks: CarvingBlocks,
     pub(super) block_tags: BTreeMap<String, Vec<String>>,
@@ -2417,6 +2419,15 @@ trait SeededPipeline: Send + Sync {
         worker: &mut WorkerState,
         region: &mut [ProtoChunk; 9],
     ) -> Result<DecorateStats, GeneratorError>;
+    /// `MinecraftServer.setInitialSpawn`'s bonus chest over a decorated
+    /// region (skyline places it before the protos columnize; `random` is
+    /// vanilla's `level.getRandom()`, a `LegacyRandomSource`).
+    fn place_bonus_chest(
+        &self,
+        region: &mut [ProtoChunk; 9],
+        origin: [i32; 3],
+        random: &mut LegacyRandom,
+    ) -> Result<bool, GeneratorError>;
     fn data(&self) -> &Arc<GeneratorData>;
     /// What the shared caches hold, for `horizon-ctl memory`.
     fn cache_census(&self) -> CacheCensus {
@@ -2535,6 +2546,28 @@ where
                     region,
                     &mut random,
                     self.structures.as_ref(),
+                )
+            }
+            None => Err(resource("decoration resources were not loaded")),
+        }
+    }
+    fn place_bonus_chest(
+        &self,
+        region: &mut [ProtoChunk; 9],
+        origin: [i32; 3],
+        random: &mut LegacyRandom,
+    ) -> Result<bool, GeneratorError> {
+        match &self.decoration {
+            Some(decoration) => {
+                let mut level_random = self.region_random_at(region[4].position());
+                decoration.place_bonus_chest(
+                    &self.data,
+                    self.seed,
+                    self.generation(),
+                    region,
+                    origin,
+                    &mut level_random,
+                    random,
                 )
             }
             None => Err(resource("decoration resources were not loaded")),
@@ -3362,7 +3395,7 @@ impl OverworldGenerator {
     /// The overworld without structures (no starts, terrain adaptation or
     /// structure pieces), as in a world with structure generation disabled.
     pub fn without_structures(data: Arc<GeneratorData>, seed: i64) -> Result<Self, GeneratorError> {
-        Self::build(data, seed, "minecraft:normal", "minecraft:overworld", false)
+        Self::build(data, seed, "minecraft:normal", "minecraft:overworld", false, None)
     }
     /// Any noise-generator dimension of a bundled world preset.
     pub fn for_dimension(
@@ -3371,7 +3404,7 @@ impl OverworldGenerator {
         preset: &str,
         dimension: &str,
     ) -> Result<Self, GeneratorError> {
-        Self::build(data, seed, preset, dimension, true)
+        Self::build(data, seed, preset, dimension, true, None)
     }
     /// A superflat overworld (`FlatLevelSource`): the layers where the terrain would be, a
     /// fixed biome, and the structure sets `structure_overrides` allows (every one when it
@@ -3488,7 +3521,23 @@ impl OverworldGenerator {
         dimension: &str,
         structures: bool,
     ) -> Result<Self, GeneratorError> {
-        Self::build(data, seed, preset, dimension, structures)
+        Self::build(data, seed, preset, dimension, structures, None)
+    }
+    /// `for_world` with the stem generator's `biome_source` replaced by a
+    /// fixed source of `biome` (`{"type":"minecraft:fixed","biome":…}`) — the
+    /// stem a `single_biome_surface` world's `world_gen_settings` records.
+    /// `None` keeps the preset's own source (`for_world` exactly). Skyline's
+    /// create screen picks the biome at world creation, so it cannot wait
+    /// for an edited stem to arrive through the dimension registry.
+    pub fn for_world_biome(
+        data: Arc<GeneratorData>,
+        seed: i64,
+        preset: &str,
+        dimension: &str,
+        biome: Option<&str>,
+        structures: bool,
+    ) -> Result<Self, GeneratorError> {
+        Self::build(data, seed, preset, dimension, structures, biome)
     }
     fn build(
         data: Arc<GeneratorData>,
@@ -3496,6 +3545,7 @@ impl OverworldGenerator {
         preset: &str,
         dimension: &str,
         with_structures: bool,
+        fixed_biome: Option<&str>,
     ) -> Result<Self, GeneratorError> {
         Self::for_world_with_settings(data, seed, preset, dimension, with_structures, None)
     }
@@ -3521,7 +3571,14 @@ impl OverworldGenerator {
             )?;
             preset_json["dimensions"][dimension].clone()
         };
-        let generator = stem["generator"].clone();
+        let mut generator = stem["generator"].clone();
+        // `for_world_biome`: the fixed-biome source the create flow edits in.
+        if let Some(biome) = fixed_biome {
+            generator["biome_source"] = serde_json::json!({
+                "type": "minecraft:fixed",
+                "biome": biome,
+            });
+        }
         // The level's build range: its dimension type's, a data pack's
         // over the vanilla one.
         let level = overrides::LevelHeight::of_type(&stem["type"], &data.dimension_types)
@@ -3630,6 +3687,20 @@ impl OverworldGenerator {
         center: ChunkPos,
     ) -> Box<dyn super::structure::legacy::PieceRandom> {
         self.pipeline.region_random(center)
+    }
+    /// The new world's bonus chest — vanilla's `MinecraftServer.setInitialSpawn`
+    /// runs `BonusChestFeature.place` on the loaded spawn chunk; skyline runs it
+    /// on the decorated proto region before columnization, writing the chest
+    /// (loot table and seed) and its torches into the proto chunks the way
+    /// `decorate`'s region view does. `origin` is the world spawn block — the
+    /// chest goes to its chunk — and `random` is `level.getRandom()`.
+    pub fn place_bonus_chest(
+        &self,
+        region: &mut [ProtoChunk; 9],
+        origin: [i32; 3],
+        random: &mut LegacyRandom,
+    ) -> Result<bool, GeneratorError> {
+        self.pipeline.place_bonus_chest(region, origin, random)
     }
     /// `NoiseBasedChunkGenerator.addDebugScreenInfo`: the `Density` line of
     /// the noise settings' `debug_functions` at the feet (none without them).
