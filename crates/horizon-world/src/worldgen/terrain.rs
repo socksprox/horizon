@@ -126,6 +126,24 @@ impl From<AquiferError> for TerrainError {
     }
 }
 
+/// A [`TerrainChunk`]'s heap bytes by subsystem — see
+/// [`TerrainChunk::resident_bytes`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TerrainBytes {
+    /// The block sections' palettes, counts, storage words and extras.
+    pub sections: usize,
+    /// Primed heightmaps' packed arrays.
+    pub heightmaps: usize,
+    /// Per-section postprocessing offset lists.
+    pub postprocessing: usize,
+    /// Scheduled block and fluid ticks.
+    pub ticks: usize,
+}
+impl TerrainBytes {
+    pub fn total(&self) -> usize {
+        self.sections + self.heightmaps + self.postprocessing + self.ticks
+    }
+}
 /// Resident registry-backed sections, optional heightmaps and ordered per-section
 /// fluid postprocessing offsets for the noise and surface generation stages.
 pub struct TerrainChunk<'r, B: TerrainBlockStates> {
@@ -599,6 +617,31 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
     }
     pub fn postprocessing(&self) -> &[Vec<u16>] {
         &self.postprocessing
+    }
+    /// Heap bytes by what holds them (resident accounting): the section
+    /// table's own Vec slot capacity is in `self` inline, not counted here.
+    pub fn resident_bytes(&self) -> TerrainBytes {
+        TerrainBytes {
+            sections: self
+                .blocks
+                .sections
+                .iter()
+                .map(|s| s.resident_bytes())
+                .sum(),
+            heightmaps: self
+                .heightmaps
+                .iter()
+                .filter_map(|m| m.as_ref())
+                .map(|m| m.heap_bytes())
+                .sum(),
+            postprocessing: self
+                .postprocessing
+                .iter()
+                .map(|v| v.capacity() * 2)
+                .sum::<usize>()
+                + self.postprocessing.capacity() * std::mem::size_of::<Vec<u16>>(),
+            ticks: self.block_ticks.heap_bytes() + self.fluid_ticks.heap_bytes(),
+        }
     }
 
     pub fn ensure_heightmap(&mut self, kind: HeightmapType) -> &mut Heightmap {

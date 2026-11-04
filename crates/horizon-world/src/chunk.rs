@@ -473,6 +473,16 @@ impl<'r> BlockSection<'r> {
     pub(crate) fn uniform_state(&self) -> Option<BlockStateId> {
         self.storage.is_none().then(|| self.palette[0])
     }
+    /// Heap bytes held by the palette, counts, free list, storage words and
+    /// saved extras (resident accounting): [`heap_bytes`](Self::heap_bytes)
+    /// plus the extra NBT, as one figure.
+    pub fn resident_bytes(&self) -> usize {
+        self.palette.capacity() * std::mem::size_of::<BlockStateId>()
+            + self.counts.capacity() * 2
+            + self.free.capacity() * 4
+            + self.storage.as_ref().map_or(0, |s| s.heap_bytes())
+            + crate::nbt::compound_heap_bytes(&self.extra)
+    }
     pub fn set(&mut self, index: usize, state: BlockStateId) -> io::Result<BlockStateId> {
         if index >= 4096 {
             return Err(invalid("section index out of bounds"));

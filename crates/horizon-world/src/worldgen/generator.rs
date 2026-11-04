@@ -895,6 +895,24 @@ impl GeneratorData {
     pub fn release_bundles(&self) {
         *self.bundles.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
+    /// Whether the raw bundle tables are resident right now — `false`
+    /// after `release_bundles` until an accessor lazily reloads them
+    /// (resident accounting).
+    pub fn bundles_loaded(&self) -> bool {
+        self.bundles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+    /// The decoded `blocks/cached-collision` table — `None` when the
+    /// `blocks/` decodes didn't load. A caller that also wants per-state
+    /// collision shapes (walk physics) should share this Arc rather than
+    /// decode the same table a second time.
+    pub fn block_collision(
+        &self,
+    ) -> Option<Arc<crate::block_collision::BlockCollisionRegistry<'static>>> {
+        self.blocks.as_ref().map(|b| b.collision.clone())
+    }
     pub fn block_states(&self) -> &GenBlockStates {
         &self.states
     }
@@ -1129,6 +1147,70 @@ impl ProtoChunk {
             .heightmap(HeightmapType::WorldSurface)
             .and_then(|map| map.first_available(x & 15, z & 15).ok())
             .unwrap_or(self.terrain.min_y())
+    }
+    /// Heap bytes by what holds them (resident accounting): the inline
+    /// `self` size is the map slot's, not counted; `data` is shared with
+    /// every proto and counted nowhere here.
+    pub fn resident_bytes(&self) -> ProtoMem {
+        ProtoMem {
+            terrain: self.terrain.resident_bytes(),
+            biomes: self.biomes.heap_bytes(),
+            block_entities: self
+                .block_entities
+                .iter()
+                .map(|(_, nbt)| crate::nbt::compound_heap_bytes(nbt))
+                .sum::<usize>()
+                + self.block_entities.capacity()
+                    * std::mem::size_of::<([i32; 3], crate::nbt::Compound)>(),
+            entities: self
+                .entities
+                .iter()
+                .map(crate::nbt::compound_heap_bytes)
+                .sum::<usize>()
+                + self.entities.capacity() * std::mem::size_of::<crate::nbt::Compound>(),
+            structure_starts: self
+                .structure_starts
+                .iter()
+                .map(|s| s.heap_bytes())
+                .sum::<usize>()
+                + self.structure_starts.capacity()
+                    * std::mem::size_of::<Arc<super::structure::start::StructureStart>>(),
+            own_starts: self
+                .own_starts
+                .iter()
+                .map(|s| s.heap_bytes())
+                .sum::<usize>()
+                + self.own_starts.len()
+                    * std::mem::size_of::<Arc<super::structure::start::StructureStart>>(),
+        }
+    }
+}
+
+/// A [`ProtoChunk`]'s heap bytes by subsystem — see
+/// [`ProtoChunk::resident_bytes`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProtoMem {
+    /// Terrain sections, heightmaps, postprocessing and ticks.
+    pub terrain: super::terrain::TerrainBytes,
+    /// The quart-resolution biome grid.
+    pub biomes: usize,
+    /// Placed block-entity NBT.
+    pub block_entities: usize,
+    /// Placed entity NBT.
+    pub entities: usize,
+    /// Structure starts referencing this chunk.
+    pub structure_starts: usize,
+    /// The starts this chunk generated.
+    pub own_starts: usize,
+}
+impl ProtoMem {
+    pub fn total(&self) -> usize {
+        self.terrain.total()
+            + self.biomes
+            + self.block_entities
+            + self.entities
+            + self.structure_starts
+            + self.own_starts
     }
 }
 

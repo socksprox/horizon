@@ -617,6 +617,11 @@ pub struct PoolPiece {
     pub waterlogging: bool,
 }
 impl PoolPiece {
+    /// Heap bytes held by the junction list (resident accounting; the
+    /// shared `element` Arc is counted by its owner).
+    pub fn heap_bytes(&self) -> usize {
+        self.junctions.capacity() * std::mem::size_of::<Junction>()
+    }
     /// A piece as a saved start lists it (PoolElementStructurePiece's tag:
     /// `pool_element`, `PosX`/`PosY`/`PosZ`, `rotation`, `ground_level_delta`,
     /// `BB`, `junctions`, `liquid_settings`), in JSON. Harnesses place another

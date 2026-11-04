@@ -843,6 +843,21 @@ pub struct StructureStart {
     pub bounding_box: BoundingBox,
 }
 impl StructureStart {
+    /// Heap bytes held by the name and piece list (resident accounting;
+    /// legacy pieces' inner state is opaque — counted as their box only).
+    pub fn heap_bytes(&self) -> usize {
+        self.name.capacity()
+            + self.pieces.capacity()
+                * std::mem::size_of::<Piece>()
+            + self
+                .pieces
+                .iter()
+                .map(|p| match p {
+                    Piece::Pool(p) => p.heap_bytes(),
+                    Piece::Legacy(_) => std::mem::size_of::<Box<dyn LegacyPiece>>(),
+                })
+                .sum::<usize>()
+    }
     /// `StructureStart.createTag` in its own chunk; None while one of its
     /// pieces cannot be saved. `references` counts `addReference` calls,
     /// which only locating structures makes: 0 in a freshly made world.

@@ -30,9 +30,21 @@ impl JavaString {
     pub fn to_string_lossy(&self) -> String {
         String::from_utf16_lossy(&self.0)
     }
+    /// Heap bytes held by the UTF-16 buffer (resident accounting).
+    pub fn heap_bytes(&self) -> usize {
+        self.0.capacity() * 2
+    }
 }
 
 pub type Compound = BTreeMap<JavaString, Tag>;
+
+/// Heap bytes of a compound's entries — BTreeMap nodes plus each key and
+/// value's payload (resident accounting; node overhead is approximate).
+pub fn compound_heap_bytes(map: &Compound) -> usize {
+    map.iter()
+        .map(|(k, v)| 64 + k.heap_bytes() + v.heap_bytes())
+        .sum()
+}
 
 /// Float and double variants hold their IEEE bit patterns. Java's disk output
 /// canonicalizes NaNs (`DataOutputStream.writeFloat`); its network output
@@ -56,6 +68,22 @@ pub enum Tag {
 }
 
 impl Tag {
+    /// Heap bytes held by this tag's payload — container capacities plus
+    /// children's, recursively (resident accounting).
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            Self::ByteArray(v) => v.capacity(),
+            Self::IntArray(v) => v.capacity() * 4,
+            Self::LongArray(v) => v.capacity() * 8,
+            Self::String(s) => s.heap_bytes(),
+            Self::List(v) => {
+                v.capacity() * std::mem::size_of::<Tag>()
+                    + v.iter().map(Tag::heap_bytes).sum::<usize>()
+            }
+            Self::Compound(map) => compound_heap_bytes(map),
+            _ => 0,
+        }
+    }
     pub fn id(&self) -> u8 {
         match self {
             Self::End => 0,

@@ -11,6 +11,11 @@ pub struct ProtoChunkTicks {
     positions: FxHashSet<(TickTypeId, BlockPos)>,
 }
 impl ProtoChunkTicks {
+    /// Heap bytes of the tick list and dedup set (resident accounting).
+    pub fn heap_bytes(&self) -> usize {
+        self.ticks.capacity() * std::mem::size_of::<SavedTick>()
+            + self.positions.capacity() * std::mem::size_of::<(TickTypeId, BlockPos)>()
+    }
     pub fn from_saved(ticks: impl IntoIterator<Item = SavedTick>) -> Self {
         let mut result = Self::default();
         for tick in ticks {
