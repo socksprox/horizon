@@ -17,6 +17,7 @@ use horizon_core::{density::Beardifier, position::ChunkPos};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::{
+    borrow::Cow,
     collections::{BTreeSet, HashMap},
     sync::{
         Arc, Condvar, Mutex, OnceLock, RwLock, TryLockError,
@@ -87,28 +88,66 @@ impl RingWork {
             searches,
         }
     }
-    /// Run searches until none are left to take, then wait for the rest.
-    fn help<'a>(
-        &self,
-        preferred: impl Fn(usize) -> &'a BTreeSet<BiomeId>,
+    /// Search `i`'s position, computing it only the first time anyone
+    /// needs it: callers blocked on the same cell share the one run's
+    /// result. Every completion counts down `left` for `help`'s wait.
+    fn result<'a>(
+        &'a self,
+        i: usize,
+        preferred: &impl Fn(usize) -> &'a BTreeSet<BiomeId>,
         biomes: &mut dyn FnMut(&[[i32; 3]]) -> Vec<BiomeId>,
-    ) {
-        loop {
-            let i = self.next.fetch_add(1, Ordering::Relaxed);
-            let Some((set, search)) = self.searches.get(i) else {
-                break;
-            };
+    ) -> &'a ChunkPos {
+        self.found[i].get_or_init(|| {
+            let (set, search) = &self.searches[i];
             let found = if self.fixed {
                 search.find_fixed(preferred(*set), biomes)
             } else {
                 search.find(preferred(*set), biomes)
             };
-            let _ = self.found[i].set(found);
             let mut left = self.left.lock().unwrap();
             *left -= 1;
             if *left == 0 {
                 self.finished.notify_all();
             }
+            found
+        })
+    }
+    /// The positions of only the searches that can land within `margin`
+    /// chunks of (`x`, `z`) — what a chunk's `is_structure_chunk` answers
+    /// can need, exclusion-zone scans up to `margin` deep included. The
+    /// rest stay uncomputed until a chunk near them (or a locate's `help`)
+    /// asks.
+    fn rings_near<'a>(
+        &'a self,
+        x: i32,
+        z: i32,
+        margin: i32,
+        preferred: impl Fn(usize) -> &'a BTreeSet<BiomeId>,
+        biomes: &mut dyn FnMut(&[[i32; 3]]) -> Vec<BiomeId>,
+        name: impl Fn(usize) -> String,
+    ) -> Rings {
+        let mut out = Rings::new();
+        for (i, (set, search)) in self.searches.iter().enumerate() {
+            if search.may_land_near(x, z, margin) {
+                out.entry(name(*set))
+                    .or_default()
+                    .push(*self.result(i, &preferred, biomes));
+            }
+        }
+        out
+    }
+    /// Run searches until none are left to take, then wait for the rest.
+    fn help<'a>(
+        &'a self,
+        preferred: impl Fn(usize) -> &'a BTreeSet<BiomeId>,
+        biomes: &mut dyn FnMut(&[[i32; 3]]) -> Vec<BiomeId>,
+    ) {
+        loop {
+            let i = self.next.fetch_add(1, Ordering::Relaxed);
+            if self.searches.get(i).is_none() {
+                break;
+            }
+            self.result(i, &preferred, biomes);
         }
         let mut left = self.left.lock().unwrap();
         while *left > 0 {
@@ -361,23 +400,37 @@ impl StructureState {
         self.rings
             .get_or_init(|| work.rings(|set| registry.sets[set].name.clone()))
     }
-    /// The rings a chunk's starts are decided with. Before they are known,
-    /// a chunk no ring search can end near (with the exclusion zones' reach)
-    /// is decided without them: no ring chunk is near it, which is what the
-    /// rings would say. Strongholds lie 1,400 blocks out or more, so a new
-    /// world's first chunks don't wait for the 128 biome searches (seconds
-    /// on four threads); they run when a chunk near a ring needs them.
-    fn rings_for(&self, context: &mut impl StartContext, chunk: ChunkPos) -> &Rings {
+    /// The rings a chunk's starts are decided with. A ring search ends on
+    /// its ring chunk or within the square it samples: the only answers
+    /// `is_structure_chunk` and exclusion-zone scans up to `zone_reach`
+    /// deep can change are the positions of searches that may land that
+    /// near, so only those searches run — the rest stay unsearched until a
+    /// chunk near them asks (or a locate runs them all). Strongholds lie
+    /// 1,400 blocks out or more, so a new world's first chunks search
+    /// nothing, and a chunk near one ring waits for its few searches, not
+    /// all 128 (seconds on four threads).
+    fn rings_for(&self, context: &mut impl StartContext, chunk: ChunkPos) -> Cow<'_, Rings> {
         static NONE: Rings = Rings::new();
         if let Some(rings) = self.rings.get() {
-            return rings;
+            return Cow::Borrowed(rings);
         }
-        let near = self
-            .ring_work(context)
+        let work = self.ring_work(context);
+        if work
             .searches
             .iter()
-            .any(|(_, search)| search.may_land_near(chunk.x, chunk.z, self.zone_reach));
-        if near { self.rings(context) } else { &NONE }
+            .any(|(_, search)| search.may_land_near(chunk.x, chunk.z, self.zone_reach))
+        {
+            Cow::Owned(work.rings_near(
+                chunk.x,
+                chunk.z,
+                self.zone_reach,
+                |set| self.registry.ring_biomes(set),
+                &mut |quarts| context.noise_biomes(quarts),
+                |set| self.registry.sets[set].name.clone(),
+            ))
+        } else {
+            Cow::Borrowed(&NONE)
+        }
     }
     /// The structures of the random-spread sets whose start chunk is `chunk`, each with
     /// [`may_start`]'s answer, for tests.
@@ -475,7 +528,7 @@ impl StructureState {
                             &self.bindings,
                             context,
                             &self.possible_sets,
-                            rings,
+                            &rings,
                             chunk,
                         )
                         .into_iter()
@@ -559,7 +612,7 @@ impl StructureState {
                 &self.bindings,
                 context,
                 &self.possible_sets,
-                rings,
+                &rings,
                 chunk,
             )
             .into_iter()

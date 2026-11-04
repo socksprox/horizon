@@ -5241,6 +5241,52 @@ mod tests {
         assert!(held > 0 && skipped > 0, "held {held}, skipped {skipped}");
     }
 
+    /// Chunks a ring search may land near get their starts from only the
+    /// searches that may land near: their answers match what the completed
+    /// map gives for them, and the map stays unpublished until the full
+    /// pass (a locate, `ring_positions`) runs it.
+    #[test]
+    fn starts_near_the_rings_match_the_completed_map() {
+        let Some(data) = prepared_data() else {
+            return;
+        };
+        let generator = OverworldGenerator::new(data.clone(), 4321).expect("generator");
+        let mut worker = generator.worker();
+        let summary = |worker: &mut GeneratorWorker, c: ChunkPos| -> Vec<(String, i32, i32)> {
+            worker
+                .structure_starts(c)
+                .iter()
+                .map(|s| (s.name.clone(), s.chunk.x, s.chunk.z))
+                .collect()
+        };
+        // Chunks where some search may land: the searches' spread reaches
+        // ±8+zone_reach chunks of their ring chunks, which sit up to ~5,000
+        // blocks out on the outer rings.
+        let searches = crate::worldgen::structure::stronghold::ring_searches(4321, 32, 3, 128);
+        let mut near = Vec::new();
+        'outer: for x in (-380..=380).step_by(9) {
+            for z in (-380..=380).step_by(9) {
+                if searches.iter().any(|s| s.may_land_near(x, z, 0)) {
+                    near.push(ChunkPos::new(x, z));
+                    if near.len() >= 32 {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        assert!(!near.is_empty(), "no chunks near a ring search");
+        let before: Vec<_> = near.iter().map(|&c| summary(&mut worker, c)).collect();
+        let searched = || data.ring_cache.lock().unwrap()[0].1.get().is_some();
+        assert!(!searched(), "the near path must not complete the map");
+        let rings = worker
+            .ring_positions("minecraft:strongholds")
+            .expect("ring positions");
+        assert_eq!(rings.len(), 128);
+        worker.forget_structure_starts();
+        let after: Vec<_> = near.iter().map(|&c| summary(&mut worker, c)).collect();
+        assert_eq!(before, after);
+    }
+
     /// Generators of one seed and dimension share their ring positions;
     /// another seed or generator gets its own, and old entries go.
     #[test]
