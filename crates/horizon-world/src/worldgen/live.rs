@@ -102,23 +102,23 @@ impl LiveFeatures {
                 .enumerate()
                 .map(|(i, name)| (name.to_string(), BiomeId(i as u32)))
                 .collect(),
-            &data.biome_tags,
+            &*data.biome_tags()?,
         )?);
         let mut bindings = data
             .feature_block_bindings()?
             .with_fluid_tags(&resources.fluid_tags)?
             .with_biomes(biomes.clone());
-        if let Some(structures) = &data.structures {
-            bindings = bindings.with_structures(structures.clone());
+        if let Some(structures) = data.structures()? {
+            bindings = bindings.with_structures(structures);
         }
-        if let Some(blocks) = &data.blocks {
+        if let Some(blocks) = data.blocks()? {
             bindings = bindings
                 .with_block_properties(&blocks.properties)?
                 .with_state_providers(
                     StateProviderBindings::new(
                         registry,
                         data.integers().clone(),
-                        &data.block_tags,
+                        &*data.block_tags()?,
                     )?
                     .with_block_properties(&blocks.properties)?
                     .with_fluid_tags(&resources.fluid_tags)?
@@ -151,7 +151,7 @@ impl LiveFeatures {
             .tags;
         let mut bone_meal = Vec::with_capacity(data.biome_names().len());
         for i in 0..data.biome_names().len() {
-            let biome: Value = serde_json::from_str(data.biome_json(BiomeId(i as u32)))?;
+            let biome: Value = serde_json::from_str(&data.biome_json(BiomeId(i as u32))?)?;
             let mut list = Vec::new();
             for step in biome["features"].as_array().into_iter().flatten() {
                 let entries: Vec<String> = match step {
@@ -199,7 +199,9 @@ impl LiveFeatures {
         let temperatures = (0..data.biome_names().len())
             .map(|i| {
                 super::biome_temperature::BiomeTemperatureSettings::from_json(
-                    data.biome_json(BiomeId(i as u32)),
+                    &data
+                        .biome_json(BiomeId(i as u32))
+                        .map_err(|e| super::DecodeError::Registry(e.to_string()))?,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -332,13 +334,20 @@ impl LiveFeatures {
     /// Whether the named biome is in a biome tag (`minecraft:...`).
     pub fn biome_in_tag(&self, biome: &str, tag: &str) -> bool {
         self.data
-            .biome_tags
-            .get(tag)
-            .is_some_and(|members| members.iter().any(|m| m == biome))
+            .biome_tags()
+            .map(|tags| {
+                tags.get(tag)
+                    .is_some_and(|members| members.iter().any(|m| m == biome))
+            })
+            .unwrap_or(false)
     }
     /// A block tag's members in registry tag order (for `getRandomElementOf`).
-    pub fn block_tag_entries(&self, tag: &str) -> &[String] {
-        self.data.block_tags.get(tag).map_or(&[], Vec::as_slice)
+    pub fn block_tag_entries(&self, tag: &str) -> Vec<String> {
+        self.data
+            .block_tags()
+            .ok()
+            .and_then(|tags| tags.get(tag).cloned())
+            .unwrap_or_default()
     }
     /// `BiomeGenerationSettings.getBoneMealFeatures` of a biome.
     pub fn bone_meal_features(&self, biome: BiomeId) -> &[String] {

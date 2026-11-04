@@ -206,27 +206,35 @@ pub struct GeneratorData {
     source_catalog: BiomeSourceCatalog,
     biome_names: Vec<Arc<str>>,
     biome_ids: BTreeMap<String, BiomeId>,
-    biome_json: Vec<String>,
     /// Per-biome temperature settings, seeding `WorkerState.temperatures`
     /// (and the same cache `place_bonus_chest`'s world borrows).
     pub(super) temperatures: Vec<BiomeTemperatureSettings>,
     biome_carvers: Vec<Vec<Arc<WorldCarver>>>,
     carving_blocks: CarvingBlocks,
-    pub(super) block_tags: BTreeMap<String, Vec<String>>,
+    /// The fluid tag table `blocks/`'s survival registry decodes against
+    /// (five entries — trivially resident where `Bundles` keeps its own).
+    fluid_tags: BTreeMap<String, Vec<String>>,
+    /// `block_tags`, `biome_tags` and the per-biome resource JSON: raw
+    /// tables only builds and lazy accessors read — `release_tables`
+    /// drops them and each accessor re-derives from the bundle files.
+    block_tags: Mutex<Option<BTreeMap<String, Vec<String>>>>,
     /// `block_tags` bound to block states, once for the feature bindings of
     /// decoration, structures and live features (`feature_block_bindings`).
     bound_block_tags: std::sync::OnceLock<super::block_feature::BoundBlockTags>,
-    pub(super) biome_tags: BTreeMap<String, Vec<String>>,
+    biome_tags: Mutex<Option<BTreeMap<String, Vec<String>>>>,
+    biome_json: Mutex<Option<Vec<String>>>,
     /// Block properties, support, collision and survival for placement
-    /// checks — `feature_resources`' decoded `blocks/` half, resident
-    /// (decorate reads it per chunk) where the raw maps moved into
-    /// `bundles`.
-    pub(super) blocks: Option<super::generator_blocks::BlockBehavior>,
-    /// Templates, processor lists and per-state template transforms.
-    pub(super) structures: Option<Arc<super::structure::StructureResources>>,
+    /// checks — `feature_resources`' decoded `blocks/` half (decorate
+    /// reads it per chunk). `release_decodes` drops it; `blocks()`
+    /// reloads it from the `blocks/` files on the next use.
+    blocks: Mutex<Resident<Arc<super::generator_blocks::BlockBehavior>>>,
+    /// Templates, processor lists and per-state template transforms —
+    /// `release_decodes` drops it, `structures()` reloads it.
+    structures: Mutex<Resident<Arc<super::structure::StructureResources>>>,
     /// Block shape-update behaviour (`block-behaviours.json` next to the
-    /// worldgen directory) for template placement's neighbor updates.
-    pub(super) behaviours: Option<Arc<crate::level::Behaviours>>,
+    /// worldgen directory) for template placement's neighbor updates —
+    /// `release_decodes` drops it, `behaviours()` reloads it.
+    behaviours: Mutex<Resident<Arc<crate::level::Behaviours>>>,
     /// Concentric ring positions by seed and dimension generator (see
     /// `rings_for`), most recent last.
     ring_cache: Mutex<Vec<RingCacheEntry>>,
@@ -511,11 +519,41 @@ impl Bundles {
 /// The loaded [`Bundles`], lock-held: generation code reads the raw
 /// tables only while a build decodes them, so a guard is never held
 /// across `decoration_for`/`StructureState::new` — they take their own.
-pub(super) struct BundlesGuard<'a>(std::sync::MutexGuard<'a, Option<Bundles>>);
+/// A guard that had to reload (`release_bundles` had dropped the tables)
+/// releases them again on drop: a lazy access never leaves the raw
+/// tables resident.
+pub(super) struct BundlesGuard<'a> {
+    guard: std::sync::MutexGuard<'a, Option<Bundles>>,
+    reloaded: bool,
+}
 impl std::ops::Deref for BundlesGuard<'_> {
     type Target = Bundles;
     fn deref(&self) -> &Bundles {
-        self.0.as_ref().expect("bundles held by the guard")
+        self.guard.as_ref().expect("bundles held by the guard")
+    }
+}
+impl Drop for BundlesGuard<'_> {
+    fn drop(&mut self) {
+        if self.reloaded {
+            *self.guard = None;
+        }
+    }
+}
+/// A table a `release_*` method may drop and its accessor lazily reload:
+/// `Unresolved` until the accessor rebuilds it, `Absent` when the bundle
+/// files don't carry it, `Present` otherwise.
+pub(super) enum Resident<T> {
+    Unresolved,
+    Absent,
+    Present(T),
+}
+/// Lock-held read access to a reloadable table (`Mutex<Option<T>>` where
+/// `None` means the accessor is filling it): derefs to the resident table.
+pub(super) struct TableGuard<'a, T>(std::sync::MutexGuard<'a, Option<T>>);
+impl<T> std::ops::Deref for TableGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.0.as_ref().expect("table held by the guard")
     }
 }
 /// `load` on a thread of its own ("Worldgen loader").
@@ -755,8 +793,14 @@ impl GeneratorData {
         let structures = joined(structures)?;
         let behaviours = joined(behaviours);
         Ok(Arc::new(Self {
-            behaviours,
-            structures,
+            behaviours: Mutex::new(match behaviours {
+                Some(behaviours) => Resident::Present(behaviours),
+                None => Resident::Absent,
+            }),
+            structures: Mutex::new(match structures {
+                Some(structures) => Resident::Present(structures),
+                None => Resident::Absent,
+            }),
             registry,
             states: GenBlockStates(states.into()),
             integers,
@@ -769,13 +813,17 @@ impl GeneratorData {
             source_catalog,
             biome_names,
             biome_ids,
-            biome_json,
+            biome_json: Mutex::new(Some(biome_json)),
             temperatures,
             biome_carvers,
             carving_blocks,
-            block_tags,
-            biome_tags,
-            blocks,
+            fluid_tags,
+            block_tags: Mutex::new(Some(block_tags)),
+            biome_tags: Mutex::new(Some(biome_tags)),
+            blocks: Mutex::new(match blocks {
+                Some(blocks) => Resident::Present(Arc::new(blocks)),
+                None => Resident::Absent,
+            }),
             ring_cache: Mutex::new(Vec::new()),
             decorations: Mutex::new(Vec::new()),
             old_chunk_facts: OnceLock::new(),
@@ -876,7 +924,8 @@ impl GeneratorData {
     /// their own, it deadlocks.
     pub(super) fn bundles(&self) -> Result<BundlesGuard<'_>, GeneratorError> {
         let mut guard = self.bundles.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_none() {
+        let reloaded = guard.is_none();
+        if reloaded {
             *guard = Some(Bundles::read(
                 &self.bundle_dir,
                 &self.overrides,
@@ -884,7 +933,7 @@ impl GeneratorData {
                 &mut Vec::new(),
             )?);
         }
-        Ok(BundlesGuard(guard))
+        Ok(BundlesGuard { guard, reloaded })
     }
     /// Free the raw bundle tables (~7 MB of the bundled overworld data)
     /// a build decoded and generation never re-reads — a small-heap
@@ -904,6 +953,152 @@ impl GeneratorData {
             .unwrap_or_else(|e| e.into_inner())
             .is_some()
     }
+    /// Drop the raw `block_tags`/`biome_tags`/`biome_json` tables (~1.3 MB
+    /// of the bundled overworld data): only builds and lazy accessors read
+    /// them, and each accessor re-derives its table from the bundle files
+    /// on the next use.
+    pub fn release_tables(&self) {
+        *self.block_tags.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.biome_tags.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.biome_json.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    /// Drop the decoded `blocks/`, `structure/` and `block-behaviours.json`
+    /// tables (~10 MB resident). Placement and structure generation
+    /// reload them on demand ([`blocks`](Self::blocks),
+    /// [`structures`](Self::structures), [`behaviours`](Self::behaviours)) —
+    /// a released table stalls the next use on its decode rather than
+    /// failing or changing answers.
+    pub fn release_decodes(&self) {
+        *self.blocks.lock().unwrap_or_else(|e| e.into_inner()) = Resident::Unresolved;
+        *self.structures.lock().unwrap_or_else(|e| e.into_inner()) = Resident::Unresolved;
+        *self.behaviours.lock().unwrap_or_else(|e| e.into_inner()) = Resident::Unresolved;
+    }
+    /// The `block_tags` table, resident — re-derived from `block_tags.json`
+    /// after a [`release_tables`](Self::release_tables) dropped it. Lock
+    /// order: a guard of this table may be held across [`blocks`]/[`structures`]
+    /// reloads; nothing takes this lock while holding theirs.
+    pub(super) fn block_tags(
+        &self,
+    ) -> Result<TableGuard<'_, BTreeMap<String, Vec<String>>>, GeneratorError> {
+        let mut guard = self.block_tags.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            let raw = read_bundle(
+                &self.bundle_dir,
+                &self.overrides,
+                self.packed.as_deref(),
+                "block_tags",
+            )?;
+            *guard = Some(build_tags(
+                &raw,
+                &self.overrides,
+                "block_tags",
+                &mut Vec::new(),
+                |id| self.registry.default_state(id).is_some(),
+            )?);
+        }
+        Ok(TableGuard(guard))
+    }
+    /// The `biome_tags` table, resident — re-derived the same way.
+    pub(super) fn biome_tags(
+        &self,
+    ) -> Result<TableGuard<'_, BTreeMap<String, Vec<String>>>, GeneratorError> {
+        let mut guard = self.biome_tags.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            let raw = read_bundle(
+                &self.bundle_dir,
+                &self.overrides,
+                self.packed.as_deref(),
+                "biome_tags",
+            )?;
+            *guard = Some(build_tags(
+                &raw,
+                &self.overrides,
+                "biome_tags",
+                &mut Vec::new(),
+                |id| self.biome_ids.contains_key(id),
+            )?);
+        }
+        Ok(TableGuard(guard))
+    }
+    /// The decoded `blocks/` behaviour tables — re-decoded from the
+    /// `blocks/` files after a [`release_decodes`](Self::release_decodes).
+    /// `None` when the bundle carries no `blocks/` tables at all.
+    pub(super) fn blocks(
+        &self,
+    ) -> Result<Option<Arc<super::generator_blocks::BlockBehavior>>, GeneratorError> {
+        let mut guard = self.blocks.lock().unwrap_or_else(|e| e.into_inner());
+        if let Resident::Unresolved = &*guard {
+            let tags = self.block_tags()?;
+            *guard = match super::generator_blocks::BlockBehavior::load(
+                &self.bundle_dir.join("blocks"),
+                self.registry,
+                &tags,
+                &self.fluid_tags,
+                self.packed.as_deref(),
+            )? {
+                Some(blocks) => Resident::Present(Arc::new(blocks)),
+                None => Resident::Absent,
+            };
+        }
+        Ok(match &*guard {
+            Resident::Present(blocks) => Some(blocks.clone()),
+            _ => None,
+        })
+    }
+    /// The structure templates/processors/transforms — rebuilt after a
+    /// [`release_decodes`](Self::release_decodes).
+    pub(super) fn structures(
+        &self,
+    ) -> Result<Option<Arc<super::structure::StructureResources>>, GeneratorError> {
+        let mut guard = self.structures.lock().unwrap_or_else(|e| e.into_inner());
+        if let Resident::Unresolved = &*guard {
+            let (dir, ov, src) = (&self.bundle_dir, &self.overrides, self.packed.as_deref());
+            let json = match src.and_then(|src| src.bytes("blocks/structure-blocks.json")) {
+                Some(bytes) => Some(String::from_utf8(bytes).map_err(|_| {
+                    resource("blocks/structure-blocks.json is not UTF-8")
+                })?),
+                None => fs::read_to_string(dir.join("blocks/structure-blocks.json")).ok(),
+            };
+            *guard = match json {
+                Some(json) => {
+                    let tags = self.block_tags()?;
+                    Resident::Present(Arc::new(super::structure::StructureResources::new(
+                        self.registry,
+                        super::structure::StateTransforms::from_json(&json, self.registry.len())?,
+                        &dir.join("structure"),
+                        read_optional_bundle(dir, ov, src, "processor_lists")?.unwrap_or_default(),
+                        &tags,
+                    )))
+                }
+                None => Resident::Absent,
+            };
+        }
+        Ok(match &*guard {
+            Resident::Present(resources) => Some(resources.clone()),
+            _ => None,
+        })
+    }
+    /// The `block-behaviours.json` decode — rebuilt after a
+    /// [`release_decodes`](Self::release_decodes). Load errors stay
+    /// `None`, the same degradation `load` applies.
+    pub(super) fn behaviours(&self) -> Option<Arc<crate::level::Behaviours>> {
+        let mut guard = self.behaviours.lock().unwrap_or_else(|e| e.into_inner());
+        if let Resident::Unresolved = &*guard {
+            *guard = match self
+                .bundle_dir
+                .parent()
+                .filter(|root| root.join("block-behaviours.json").exists())
+                .and_then(|root| crate::level::Behaviours::load(self.registry, root).ok())
+            {
+                Some(behaviours) => Resident::Present(Arc::new(behaviours)),
+                None => Resident::Absent,
+            };
+        }
+        match &*guard {
+            Resident::Present(behaviours) => Some(behaviours.clone()),
+            _ => None,
+        }
+    }
     /// The decoded `blocks/cached-collision` table — `None` when the
     /// `blocks/` decodes didn't load. A caller that also wants per-state
     /// collision shapes (walk physics) should share this Arc rather than
@@ -911,7 +1106,7 @@ impl GeneratorData {
     pub fn block_collision(
         &self,
     ) -> Option<Arc<crate::block_collision::BlockCollisionRegistry<'static>>> {
-        self.blocks.as_ref().map(|b| b.collision.clone())
+        self.blocks().ok()?.as_ref().map(|b| b.collision.clone())
     }
     /// The `blocks/block-properties.nbt` `occlusion` table's decode —
     /// `Some` until the first taker (then `None`, like the `blocks/`
@@ -952,19 +1147,21 @@ impl GeneratorData {
     }
     fn old_chunk_facts(&self) -> &OldChunkFacts {
         self.old_chunk_facts.get_or_init(|| {
-            let members = |tag: &str| -> std::collections::HashSet<&str> {
-                self.block_tags
-                    .get(tag)
+            let tags = self.block_tags().ok();
+            let members = |tag: &str| -> std::collections::HashSet<String> {
+                tags.as_ref()
+                    .and_then(|tags| tags.get(tag))
                     .into_iter()
                     .flatten()
-                    .map(String::as_str)
+                    .cloned()
                     .collect()
             };
             let (leaves, logs) = (members("minecraft:leaves"), members("minecraft:logs"));
             let collision = self
-                .blocks
-                .as_ref()
-                .map(|blocks| &blocks.collision);
+                .blocks()
+                .ok()
+                .flatten()
+                .map(|blocks| blocks.collision.clone());
             let surface_names = [
                 "minecraft:podzol",
                 "minecraft:gravel",
@@ -999,7 +1196,7 @@ impl GeneratorData {
                     );
                 ground.push(
                     !excluded
-                        && match collision {
+                        && match collision.as_deref() {
                             Some(registry) => registry
                                 .collision_block(id)
                                 .map_or(true, |block| !block.empty_shape),
@@ -1033,9 +1230,23 @@ impl GeneratorData {
         self.biome_ids.get(name).copied()
     }
     /// The biome's resource JSON (climate, effects such as water/sky/foliage
-    /// colors, attributes, carvers and features).
-    pub fn biome_json(&self, id: BiomeId) -> &str {
-        &self.biome_json[id.0 as usize]
+    /// colors, attributes, carvers and features) — owned because the table
+    /// may sit behind a [`release_tables`](Self::release_tables) reload.
+    pub fn biome_json(&self, id: BiomeId) -> Result<String, GeneratorError> {
+        let mut guard = self.biome_json.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = Some(
+                read_bundle(
+                    &self.bundle_dir,
+                    &self.overrides,
+                    self.packed.as_deref(),
+                    "biomes",
+                )?
+                .into_values()
+                .collect(),
+            );
+        }
+        Ok(guard.as_ref().expect("biome_json held")[id.0 as usize].clone())
     }
     pub(super) fn integers(&self) -> &BTreeSet<(String, String)> {
         &self.integers
@@ -1049,7 +1260,10 @@ impl GeneratorData {
         let bound = match self.bound_block_tags.get() {
             Some(bound) => bound.clone(),
             None => {
-                let bound = FeatureBlockBindings::bind_tags(self.registry, &self.block_tags)?;
+                let tags = self
+                    .block_tags()
+                    .map_err(|e| DecodeError::Registry(e.to_string()))?;
+                let bound = FeatureBlockBindings::bind_tags(self.registry, &tags)?;
                 self.bound_block_tags.get_or_init(|| bound).clone()
             }
         };

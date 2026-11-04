@@ -241,7 +241,10 @@ fn biome_set(data: &GeneratorData, value: &Value) -> Result<BTreeSet<BiomeId>, s
     for name in names {
         match name.strip_prefix('#') {
             Some(tag) => {
-                for biome in data.biome_tags.get(tag).into_iter().flatten() {
+                let tags = data
+                    .biome_tags()
+                    .map_err(|_| super::DecodeError::Field("biome tag table"))?;
+                for biome in tags.get(tag).into_iter().flatten() {
                     out.extend(data.biome_id(biome));
                 }
             }
@@ -257,7 +260,7 @@ impl StructureState {
         rings: Arc<OnceLock<Rings>>,
     ) -> Result<Option<Self>, GeneratorError> {
         let bundles = data.bundles()?;
-        let (Some(resources), Some(raw)) = (&data.structures, &bundles.structure_resources) else {
+        let (Some(resources), Some(raw)) = (data.structures()?, &bundles.structure_resources) else {
             return Ok(None);
         };
         let registry =
@@ -281,7 +284,7 @@ impl StructureState {
         }
         let mut bindings = data.feature_block_bindings()?;
         // Processors that test what a block is made of read canOcclude.
-        if let Some(blocks) = data.blocks.as_ref() {
+        if let Some(blocks) = data.blocks()? {
             bindings = bindings.with_block_properties(&blocks.properties)?;
         }
         let zone_reach = registry.zone_reach();

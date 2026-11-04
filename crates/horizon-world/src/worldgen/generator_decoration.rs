@@ -182,23 +182,23 @@ impl Decoration {
                 .enumerate()
                 .map(|(i, name)| (name.to_string(), BiomeId(i as u32)))
                 .collect(),
-            &data.biome_tags,
+            &*data.biome_tags()?,
         )?);
         let mut bindings = data
             .feature_block_bindings()?
             .with_fluid_tags(&resources.fluid_tags)?
             .with_biomes(biomes.clone());
-        if let Some(structures) = &data.structures {
-            bindings = bindings.with_structures(structures.clone());
+        if let Some(structures) = data.structures()? {
+            bindings = bindings.with_structures(structures);
         }
-        if let Some(blocks) = &data.blocks {
+        if let Some(blocks) = data.blocks()? {
             bindings = bindings
                 .with_block_properties(&blocks.properties)?
                 .with_state_providers(
                     StateProviderBindings::new(
                         registry,
                         data.integers().clone(),
-                        &data.block_tags,
+                        &*data.block_tags()?,
                     )?
                     .with_block_properties(&blocks.properties)?
                     .with_fluid_tags(&resources.fluid_tags)?
@@ -237,7 +237,7 @@ impl Decoration {
             let id = data
                 .biome_id(&name)
                 .ok_or_else(|| resource(format!("unknown biome {name}")))?;
-            let json: Value = serde_json::from_str(data.biome_json(id))?;
+            let json: Value = serde_json::from_str(&data.biome_json(id)?)?;
             let mut steps = Vec::new();
             for (index, step) in json["features"]
                 .as_array()
@@ -450,7 +450,7 @@ impl Decoration {
             structure_mobs: worker.structure_mobs.clone(),
             starts: references.clone(),
             biome_names: data.biome_names(),
-            blocks: data.blocks.as_ref(),
+            blocks: data.blocks()?,
             region: terrain,
             biomes: BiomeRegion::new(biomes, obfuscate_seed(seed))
                 .map_err(|e| resource(e.to_string()))?,
@@ -460,7 +460,7 @@ impl Decoration {
             biome_quarts: region[4].biomes().quart_range(),
             decoration: self,
             temperatures: &mut worker.temperatures,
-            behaviours: data.behaviours.as_deref(),
+            behaviours: data.behaviours(),
             // WorldGenRegion.isOutsideBuildHeight: the level's range, not the noise's.
             build: (min_y, min_y + height),
             shape_ticks: std::cell::RefCell::new(crate::level::Ticks::new(0)),
@@ -669,7 +669,7 @@ impl Decoration {
             structure_mobs: None,
             starts: region[4].structure_starts.clone(),
             biome_names: data.biome_names(),
-            blocks: data.blocks.as_ref(),
+            blocks: data.blocks()?,
             region: terrain,
             biomes: BiomeRegion::new(biomes, obfuscate_seed(seed))
                 .map_err(|e| resource(e.to_string()))?,
@@ -679,7 +679,7 @@ impl Decoration {
             biome_quarts: region[4].biomes().quart_range(),
             decoration: self,
             temperatures: &mut temperatures,
-            behaviours: data.behaviours.as_deref(),
+            behaviours: data.behaviours(),
             build: (min_y, min_y + height),
             shape_ticks: std::cell::RefCell::new(crate::level::Ticks::new(0)),
         };
@@ -820,7 +820,7 @@ struct World<'a> {
     structure_mobs: Option<Arc<dyn super::generator::StructureMobs>>,
     starts: Vec<Arc<super::structure::start::StructureStart>>,
     biome_names: &'a [Arc<str>],
-    blocks: Option<&'a BlockBehavior>,
+    blocks: Option<Arc<BlockBehavior>>,
     region: TerrainRegion<'static, GenBlockStates>,
     biomes: BiomeRegion<BiomeId>,
     zone: GenerationWriteZone,
@@ -832,7 +832,7 @@ struct World<'a> {
     biome_quarts: (i32, i32),
     decoration: &'a Decoration,
     temperatures: &'a mut [BiomeTemperature],
-    behaviours: Option<&'a crate::level::Behaviours>,
+    behaviours: Option<Arc<crate::level::Behaviours>>,
     /// Inclusive minimum and exclusive maximum build height.
     build: (i32, i32),
     /// The tick capture `shape_update` passes to `updateShape`.
@@ -1092,8 +1092,8 @@ fn loot_table_nbt(
     Some(nbt)
 }
 impl<'a> World<'a> {
-    fn blocks(&self) -> Result<&'a BlockBehavior, PlacementQueryError> {
-        self.blocks.ok_or(PlacementQueryError::Unavailable)
+    fn blocks(&self) -> Result<&BlockBehavior, PlacementQueryError> {
+        self.blocks.as_deref().ok_or(PlacementQueryError::Unavailable)
     }
 }
 /// Proto chunks hold no block entities, so dynamic shapes resolve to absent.
@@ -1203,7 +1203,7 @@ impl PlacementContext for World<'_> {
         position: [i32; 3],
         direction: Direction,
     ) -> Result<bool, PlacementQueryError> {
-        let blocks = self.blocks()?;
+        let blocks = self.blocks.clone().ok_or(PlacementQueryError::Unavailable)?;
         blocks
             .survival
             .can_attach_to(self, position, direction)
@@ -1223,7 +1223,7 @@ impl PlacementContext for World<'_> {
         state: BlockStateId,
         position: [i32; 3],
     ) -> Result<bool, PlacementQueryError> {
-        if let (None, Some(behaviours)) = (self.blocks, self.behaviours) {
+        if let (None, Some(behaviours)) = (self.blocks.as_deref(), self.behaviours.as_deref()) {
             let mut level = ShapeLevel {
                 world: self,
                 random: horizon_core::random::LegacyRandom::new(0),
@@ -1232,7 +1232,7 @@ impl PlacementContext for World<'_> {
             let pos = BlockPos::new(position[0], position[1], position[2]);
             return Ok(behaviours.can_survive(&mut level, &mut ticks, pos, state));
         }
-        let blocks = self.blocks()?;
+        let blocks = self.blocks.clone().ok_or(PlacementQueryError::Unavailable)?;
         blocks
             .survival
             .can_survive(self, state, position)
@@ -1254,7 +1254,7 @@ impl PlacementContext for World<'_> {
     ) -> Result<bool, PlacementQueryError> {
         // Without the exported support tables, fall back to the gameplay
         // behaviour's empty-level sturdiness cache.
-        if let (None, Some(behaviours)) = (self.blocks, self.behaviours) {
+        if let (None, Some(behaviours)) = (self.blocks.as_deref(), self.behaviours.as_deref()) {
             return Ok(behaviours.is_face_sturdy(state, direction));
         }
         let support = self.blocks()?.support.clone();
@@ -1268,7 +1268,7 @@ impl PlacementContext for World<'_> {
         direction: Direction,
     ) -> Result<bool, PlacementQueryError> {
         let state = self.region.block_state(position)?;
-        if let (None, Some(behaviours)) = (self.blocks, self.behaviours) {
+        if let (None, Some(behaviours)) = (self.blocks.as_deref(), self.behaviours.as_deref()) {
             return Ok(behaviours.is_face_sturdy_center(state, direction));
         }
         let support = self.blocks()?.support.clone();
@@ -1277,7 +1277,7 @@ impl PlacementContext for World<'_> {
             .map_err(query)
     }
     fn can_occlude(&mut self, state: BlockStateId) -> Result<bool, PlacementQueryError> {
-        if let Some(behaviours) = self.behaviours {
+        if let Some(behaviours) = self.behaviours.as_deref() {
             return Ok(behaviours.has_flag(state, crate::level::data::state_flags::CAN_OCCLUDE));
         }
         let properties = &self.blocks()?.properties;
@@ -1400,7 +1400,7 @@ impl PlacementContext for World<'_> {
         direction: Direction,
         flags: i32,
     ) -> Result<(), PlacementQueryError> {
-        let Some(behaviours) = self.behaviours else {
+        let Some(behaviours) = self.behaviours.clone() else {
             return Ok(());
         };
         let n = direction.normal();
@@ -1408,27 +1408,27 @@ impl PlacementContext for World<'_> {
         let state = self.region.block(position).map_err(query)?;
         let neighbor = self.region.block(neighbor_pos).map_err(query)?;
         let (new_state, ticks) = self.shape_update(
-            behaviours,
+            &behaviours,
             state,
             position,
             direction,
             neighbor_pos,
             neighbor,
         );
-        self.schedule_captured(behaviours, ticks)?;
+        self.schedule_captured(&behaviours, ticks)?;
         if new_state != state {
             self.set_block(position, new_state, flags & !1)
                 .map_err(query)?;
         }
         let (new_neighbor, ticks) = self.shape_update(
-            behaviours,
+            &behaviours,
             neighbor,
             neighbor_pos,
             direction.opposite(),
             position,
             new_state,
         );
-        self.schedule_captured(behaviours, ticks)?;
+        self.schedule_captured(&behaviours, ticks)?;
         if new_neighbor != neighbor {
             self.set_block(neighbor_pos, new_neighbor, flags & !1)
                 .map_err(query)?;
@@ -1440,7 +1440,7 @@ impl PlacementContext for World<'_> {
         position: [i32; 3],
         flags: i32,
     ) -> Result<(), PlacementQueryError> {
-        let Some(behaviours) = self.behaviours else {
+        let Some(behaviours) = self.behaviours.clone() else {
             return Ok(());
         };
         let state = self.region.block(position).map_err(query)?;
@@ -1458,14 +1458,14 @@ impl PlacementContext for World<'_> {
             let neighbor_pos = [position[0] + n[0], position[1] + n[1], position[2] + n[2]];
             let neighbor = self.region.block(neighbor_pos).map_err(query)?;
             let (updated, ticks) = self.shape_update(
-                behaviours,
+                &behaviours,
                 new_state,
                 position,
                 direction,
                 neighbor_pos,
                 neighbor,
             );
-            self.schedule_captured(behaviours, ticks)?;
+            self.schedule_captured(&behaviours, ticks)?;
             new_state = updated;
         }
         if new_state != state {

@@ -270,9 +270,13 @@ impl Vegetation {
         let mut trees = FxHashMap::default();
         let mut chorus = FxHashMap::default();
         for (index, &biome) in map.iter().enumerate() {
-            let Ok(json) = serde_json::from_str::<Value>(
-                data.biome_json(horizon_world::worldgen::biome::BiomeId(index as u32)),
-            ) else {
+            let Ok(json) = data
+                .biome_json(horizon_world::worldgen::biome::BiomeId(index as u32))
+                .and_then(|json| {
+                    serde_json::from_str::<Value>(&json)
+                        .map_err(|e| horizon_world::worldgen::generator::GeneratorError::Decode(e.into()))
+                })
+            else {
                 continue;
             };
             let mut list = Vec::new();
