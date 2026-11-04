@@ -217,6 +217,40 @@ pub fn save_nbt(
 }
 
 impl StructureTemplate {
+    /// Heap bytes held by the palettes, their block-entity tags and the
+    /// entities (resident accounting; the decoded jigsaw lists are counted
+    /// when they exist).
+    pub fn heap_bytes(&self) -> usize {
+        self.location.len()
+            + self
+                .palettes
+                .iter()
+                .map(|palette| {
+                    palette.blocks.capacity() * std::mem::size_of::<BlockInfo>()
+                        + palette
+                            .blocks
+                            .iter()
+                            .filter_map(|b| b.nbt.as_ref())
+                            .map(|nbt| crate::nbt::compound_heap_bytes(nbt))
+                            .sum::<usize>()
+                        + palette.jigsaws.get().map_or(0, |jigsaws| {
+                            jigsaws.capacity() * std::mem::size_of::<JigsawInfo>()
+                                + jigsaws
+                                    .iter()
+                                    .map(|j| {
+                                        j.name.capacity() + j.pool.capacity() + j.target.capacity()
+                                    })
+                                    .sum::<usize>()
+                        })
+                })
+                .sum::<usize>()
+            + self.entities.capacity() * std::mem::size_of::<EntityInfo>()
+            + self
+                .entities
+                .iter()
+                .map(|e| crate::nbt::compound_heap_bytes(&e.nbt))
+                .sum::<usize>()
+    }
     /// A new, never-loaded template: zero size and no palettes.
     pub fn empty() -> Self {
         Self {

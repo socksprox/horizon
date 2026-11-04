@@ -32,7 +32,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     io::Read,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 pub use template::{BlockInfo, EntityInfo, JigsawInfo, StructureTemplate, save_nbt};
 
@@ -278,13 +281,83 @@ impl StateTransforms {
     }
 }
 
+/// Bound on the decoded templates `template()` keeps for re-use: the
+/// biggest closure one structure's pools can touch in a single assemble
+/// (trial chambers, ~180 entries and ~11 MB; a village ~120) plus a
+/// second structure assembling alongside on another worker. A miss reloads
+/// through the same cold path the first touch used, so evicting an entry
+/// changes residency only, never what `template()` returns.
+const TEMPLATE_CACHE_LIMIT: usize = 512;
+const TEMPLATE_CACHE_BYTES: usize = 24 * 1024 * 1024;
+
+/// A cached template: its decoded size (the byte bound) and the stamp of
+/// its last `template()` touch (the eviction pick, oldest first).
+struct TemplateSlot {
+    template: Option<Arc<StructureTemplate>>,
+    bytes: usize,
+    /// A `tick` stamp; u32 wraps, eviction compares ages (`wrapping_sub`),
+    /// not raw stamps.
+    tick: AtomicU32,
+}
+/// The `templates` map: a least-recently-touched eviction over the lazily
+/// loaded templates, bounded by entries and by their decoded size.
+struct TemplateCache {
+    map: HashMap<String, TemplateSlot>,
+    bytes: usize,
+}
+impl TemplateCache {
+    /// Puts `template` under `id` stamped `now`, then evicts
+    /// least-recently-touched entries until both bounds hold (the newest
+    /// stamp is picked last, so an entry bigger than the byte bound alone
+    /// stays).
+    fn insert(
+        &mut self,
+        id: String,
+        template: Option<Arc<StructureTemplate>>,
+        bytes: usize,
+        now: u32,
+    ) {
+        match self.map.entry(id) {
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                let slot = slot.get_mut();
+                self.bytes -= slot.bytes;
+                slot.template = template;
+                slot.bytes = bytes;
+                slot.tick.store(now, Ordering::Relaxed);
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(TemplateSlot {
+                    template,
+                    bytes,
+                    tick: AtomicU32::new(now),
+                });
+            }
+        }
+        self.bytes += bytes;
+        while (self.map.len() > TEMPLATE_CACHE_LIMIT || self.bytes > TEMPLATE_CACHE_BYTES)
+            && self.map.len() > 1
+        {
+            let victim = self
+                .map
+                .iter()
+                .max_by_key(|(_, slot)| now.wrapping_sub(slot.tick.load(Ordering::Relaxed)))
+                .map(|(id, _)| id.clone())
+                .expect("more than one entry");
+            let slot = self.map.remove(&victim).expect("present");
+            self.bytes -= slot.bytes;
+        }
+    }
+}
+
 /// Lazily loaded templates (`structure/<namespace>/<path>.nbt`, gzip NBT) and
 /// processor lists, shared by all generators of one resource bundle.
 pub struct StructureResources {
     pub registry: &'static BlockRegistry,
     pub transforms: StateTransforms,
     dir: PathBuf,
-    templates: RwLock<HashMap<String, Option<Arc<StructureTemplate>>>>,
+    templates: RwLock<TemplateCache>,
+    /// The stamp each `template()` touch takes (the LRU's order).
+    template_tick: AtomicU32,
     /// Data packs' template files, which win over the prepared ones.
     pack_templates: BTreeMap<String, Arc<[u8]>>,
     pub processor_lists: BTreeMap<String, String>,
@@ -347,7 +420,11 @@ impl StructureResources {
             registry,
             transforms,
             dir: dir.to_owned(),
-            templates: RwLock::new(HashMap::new()),
+            templates: RwLock::new(TemplateCache {
+                map: HashMap::new(),
+                bytes: 0,
+            }),
+            template_tick: AtomicU32::new(0),
             pack_templates: BTreeMap::new(),
             processor_lists,
             jigsaw_states,
@@ -371,8 +448,10 @@ impl StructureResources {
         } else {
             format!("minecraft:{id}")
         };
-        if let Some(found) = self.templates.read().unwrap().get(&id) {
-            return found.clone();
+        let tick = self.template_tick.fetch_add(1, Ordering::Relaxed);
+        if let Some(found) = self.templates.read().unwrap().map.get(&id) {
+            found.tick.store(tick, Ordering::Relaxed);
+            return found.template.clone();
         }
         let (namespace, path) = id.split_once(':').unwrap();
         let file = self.dir.join(namespace).join(format!("{path}.nbt"));
@@ -396,7 +475,11 @@ impl StructureResources {
         let mut loaded = loaded.unwrap_or_else(StructureTemplate::empty);
         loaded.location = id.as_str().into();
         let loaded = Some(Arc::new(loaded));
-        self.templates.write().unwrap().insert(id, loaded.clone());
+        let bytes = loaded.as_ref().map_or(0, |t| t.heap_bytes());
+        self.templates
+            .write()
+            .unwrap()
+            .insert(id, loaded.clone(), bytes, tick);
         loaded
     }
     /// Whether the state's fluid is a source (water/lava level 0, waterlogged).
@@ -415,5 +498,55 @@ impl StructureResources {
     }
     pub fn is_jigsaw(&self, state: BlockStateId) -> bool {
         self.jigsaw_states.contains_key(&state)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slot() -> Option<Arc<StructureTemplate>> {
+        Some(Arc::new(StructureTemplate::empty()))
+    }
+
+    /// The template cache evicts the least recently touched entry past its
+    /// bounds — a hit renews an entry's stamp — and a single too-big entry
+    /// still fits.
+    #[test]
+    fn template_cache_evicts_least_recently_touched() {
+        let mut cache = TemplateCache {
+            map: HashMap::new(),
+            bytes: 0,
+        };
+        for i in 0..TEMPLATE_CACHE_LIMIT {
+            cache.insert(format!("minecraft:t{i}"), slot(), 0, i as u32);
+        }
+        assert_eq!(cache.map.len(), TEMPLATE_CACHE_LIMIT);
+        // Renew the oldest, then insert over the limit: the second-oldest goes.
+        cache
+            .map
+            .get("minecraft:t0")
+            .unwrap()
+            .tick
+            .store(1000, Ordering::Relaxed);
+        cache.insert("minecraft:new".into(), slot(), 0, 1001);
+        assert_eq!(cache.map.len(), TEMPLATE_CACHE_LIMIT);
+        assert!(cache.map.contains_key("minecraft:t0"));
+        assert!(!cache.map.contains_key("minecraft:t1"));
+        assert!(cache.map.contains_key("minecraft:new"));
+
+        // The byte bound evicts likewise, and an oversized entry alone stays.
+        let mut cache = TemplateCache {
+            map: HashMap::new(),
+            bytes: 0,
+        };
+        cache.insert("minecraft:a".into(), slot(), TEMPLATE_CACHE_BYTES / 2, 0);
+        cache.insert("minecraft:b".into(), slot(), TEMPLATE_CACHE_BYTES / 2, 1);
+        assert_eq!(cache.bytes, TEMPLATE_CACHE_BYTES);
+        cache.insert("minecraft:c".into(), slot(), 1, 2);
+        assert!(!cache.map.contains_key("minecraft:a"));
+        assert!(cache.map.contains_key("minecraft:b"));
+        cache.insert("minecraft:big".into(), slot(), TEMPLATE_CACHE_BYTES * 2, 3);
+        assert_eq!(cache.map.len(), 1);
+        assert!(cache.map.contains_key("minecraft:big"));
     }
 }
