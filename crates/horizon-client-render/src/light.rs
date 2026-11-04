@@ -384,6 +384,23 @@ impl LightScratch {
             self.sky_queue.shrink_to(MAX_QUEUE_CAPACITY);
         }
     }
+    /// Grow the flat `total`-cell slabs before the fill starts —
+    /// `try_light_chunk`'s fallible seam: a failed reservation means the
+    /// run never began, so the caller skips the job instead of dying to
+    /// `handle_alloc_error` mid-fill.
+    fn ensure(&mut self, total: usize) -> bool {
+        self.states
+            .try_reserve(total.saturating_sub(self.states.len()))
+            .is_ok()
+            && self
+                .sky
+                .try_reserve(total.saturating_sub(self.sky.len()))
+                .is_ok()
+            && self
+                .block
+                .try_reserve(total.saturating_sub(self.block.len()))
+                .is_ok()
+    }
 }
 
 /// One section's values mapped to the packed light info, and the palette's
@@ -430,7 +447,8 @@ impl At {
 /// the cells that emit light. The values are mapped to that info in one pass
 /// over the section's packed storage into `stage` (index order), then copied a
 /// row of 16 along x at a time: the region's rows are 48 apart, so the two
-/// cannot be one.
+/// cannot be one. `None`: a queue push could not grow (the caller's
+/// fallible seam, see [`try_light_chunk`]).
 fn states_of(
     section: &Section,
     tables: &LightTables,
@@ -439,7 +457,7 @@ fn states_of(
     block: &mut [u8],
     queue: &mut Vec<u32>,
     scratch: &mut SectionScratch,
-) {
+) -> Option<()> {
     if section.blocks.bits() == 0 {
         // A section of one state (the caller has skipped the air ones): a row
         // of the region is that state's info.
@@ -451,13 +469,14 @@ fn states_of(
                 if info > 0xFFFF {
                     for x in 0..16 {
                         block[p + x] = (info >> 16) as u8;
+                        queue.try_reserve(1).ok()?;
                         queue.push((p + x) as u32);
                     }
                 }
                 p += W;
             }
         }
-        return;
+        return Some(());
     }
     // The info of the ids the section stores: a list palette's ids are mapped
     // once, a global palette's are state ids, which `tables.info` holds. Only
@@ -491,13 +510,14 @@ fn states_of(
                     states[p + x] = info as u16;
                     if info > 0xFFFF {
                         block[p + x] = (info >> 16) as u8;
+                        queue.try_reserve(1).ok()?;
                         queue.push((p + x) as u32);
                     }
                 }
                 p += W;
             }
         }
-        return;
+        return Some(());
     }
     section
         .blocks
@@ -510,6 +530,7 @@ fn states_of(
             p += W;
         }
     }
+    Some(())
 }
 
 /// `region[dz][dx]` holds the chunks around the centre (index 1,1).
@@ -519,6 +540,18 @@ pub fn light_chunk(
     tables: &LightTables,
     sky_light: bool,
 ) -> Vec<Light> {
+    try_light_chunk(region, tables, sky_light).expect("light scratch reservation")
+}
+
+/// `light_chunk` with fallible growth: the per-run slabs are reserved
+/// up front and every queue push goes through `try_reserve`, so `None`
+/// means the run aborted clean — a caller at the heap wall skips the
+/// job and retries it later instead of exiting the process.
+pub fn try_light_chunk(
+    region: &[[Option<&Chunk>; 3]; 3],
+    tables: &LightTables,
+    sky_light: bool,
+) -> Option<Vec<Light>> {
     SCRATCH.with_borrow_mut(|scratch| light_chunk_with_scratch(region, tables, sky_light, scratch))
 }
 
@@ -527,7 +560,7 @@ fn light_chunk_with_scratch(
     tables: &LightTables,
     sky_light: bool,
     scratch: &mut LightScratch,
-) -> Vec<Light> {
+) -> Option<Vec<Light>> {
     let sections = region[1][1].expect("centre chunk").sections.len();
     // Highest occupied section in the region bounds the work.
     let mut top_section = 0;
@@ -544,6 +577,9 @@ fn light_chunk_with_scratch(
     let h = ((top_section + 1) * 16).min(sections * 16);
     let total = W * W * h;
 
+    if !scratch.ensure(total) {
+        return None;
+    }
     scratch.states.resize(total, 0);
     scratch.states.fill(0);
     scratch.sky.resize(total, 0);
@@ -573,7 +609,7 @@ fn light_chunk_with_scratch(
                     y: si * 16,
                     z: z_base,
                 };
-                states_of(section, tables, at, states, block, queue, section_scratch);
+                states_of(section, tables, at, states, block, queue, section_scratch)?;
             }
         }
     }
@@ -640,6 +676,9 @@ fn light_chunk_with_scratch(
                     let mut p = from * (W * W) + col;
                     for _ in from..=to {
                         if sky[p] == 15 {
+                            if sky_queue.try_reserve(1).is_err() {
+                                return None;
+                            }
                             sky_queue.push(p as u32);
                         }
                         p += W * W;
@@ -652,7 +691,7 @@ fn light_chunk_with_scratch(
     let block_masks = &tables.block_masks;
     let types = tables.types;
 
-    let spread = |light: &mut [u8], queue: &mut Vec<u32>| {
+    let spread = |light: &mut [u8], queue: &mut Vec<u32>| -> bool {
         let mut head = 0;
         while head < queue.len() {
             let p = queue[head] as usize;
@@ -680,6 +719,9 @@ fn light_chunk_with_scratch(
                         if level > light[q] + damp {
                             if block_masks[from_row + (to >> 4) as usize] & (1 << $d) == 0 {
                                 light[q] = level - damp;
+                                if queue.try_reserve(1).is_err() {
+                                    return false;
+                                }
                                 queue.push(q as u32);
                             }
                         }
@@ -705,16 +747,68 @@ fn light_chunk_with_scratch(
                 step_neighbour!(5, p + 1);
             }
         }
+        true
     };
-    spread(sky, sky_queue);
-    spread(block, queue);
-    let result = pack_lighting(sections, h, sky, block, sky_light);
+    if !spread(sky, sky_queue) || !spread(block, queue) {
+        return None;
+    }
+    let result = try_pack_lighting(sections, h, sky, block, sky_light);
     scratch.clear_queues();
     result
 }
 
+/// `Vec::new` + `try_reserve_exact` + fill, as a boxed slice — the
+/// fallible form of `Box::new([v; n])` (`len == capacity` keeps
+/// `into_boxed_slice` a no-op). `None` when the reservation fails.
+fn box_filled(n: usize, fill: u8) -> Option<Box<[u8]>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).ok()?;
+    v.resize(n, fill);
+    debug_assert_eq!(v.len(), v.capacity());
+    Some(v.into_boxed_slice())
+}
+
 /// Extract just the centre column's light (`sections` of it); never copy
-/// worker snapshot sections.
+/// worker snapshot sections. `None` when a section box can't allocate —
+/// the whole run discards, like the scratch reservation's contract.
+fn try_pack_lighting(
+    sections: usize,
+    h: usize,
+    sky: &[u8],
+    block: &[u8],
+    sky_light: bool,
+) -> Option<Vec<Light>> {
+    let open = if sky_light { 0xF0 } else { 0x00 };
+    let mut out = Vec::new();
+    out.try_reserve(sections).ok()?;
+    for si in 0..sections {
+        if si * 16 >= h {
+            out.push(Light::Uniform(open));
+            continue;
+        }
+        let mut data: Box<[u8; 4096]> = box_filled(4096, open)?.try_into().ok()?;
+        for ly in 0..16 {
+            let y = si * 16 + ly;
+            if y >= h {
+                continue;
+            }
+            let y_offset = y * (W * W);
+            for lz in 0..16 {
+                let p_row = y_offset + (16 + lz) * W + 16;
+                let out_row = (ly << 8) | (lz << 4);
+                for lx in 0..16 {
+                    let p = p_row + lx;
+                    data[out_row + lx] = sky[p] << 4 | block[p];
+                }
+            }
+        }
+        out.push(Light::try_packed(data)?);
+    }
+    Some(out)
+}
+
+/// `try_pack_lighting`'s infallible form, for tests.
+#[cfg(test)]
 fn pack_lighting(
     sections: usize,
     h: usize,
@@ -722,29 +816,22 @@ fn pack_lighting(
     block: &[u8],
     sky_light: bool,
 ) -> Vec<Light> {
-    let open = if sky_light { 0xF0 } else { 0x00 };
-    (0..sections)
-        .map(|si| {
-            if si * 16 >= h {
-                return Light::Uniform(open);
-            }
-            let mut data = Box::new([open; 4096]);
-            for ly in 0..16 {
-                let y = si * 16 + ly;
-                if y >= h {
-                    continue;
-                }
-                let y_offset = y * (W * W);
-                for lz in 0..16 {
-                    let p_row = y_offset + (16 + lz) * W + 16;
-                    let out_row = (ly << 8) | (lz << 4);
-                    for lx in 0..16 {
-                        let p = p_row + lx;
-                        data[out_row + lx] = sky[p] << 4 | block[p];
-                    }
-                }
-            }
-            Light::packed(data)
+    try_pack_lighting(sections, h, sky, block, sky_light).expect("pack light")
+}
+
+/// Undo [`apply_lighting`]'s writes for a chunk whose sections this
+/// caller already owns or made private: moves each section's `Light`
+/// back out — the bake worker's steal-back, so the computed light rides
+/// the done-message home without a second per-section copy. Shared
+/// sections (the canonical uniforms `share_uniform` re-pointed) can't
+/// move, but cloning a `Light::Uniform` is free.
+pub fn take_lighting(chunk: &mut Chunk) -> Vec<Light> {
+    chunk
+        .sections
+        .iter_mut()
+        .map(|section| match Arc::get_mut(section) {
+            Some(owned) => std::mem::replace(&mut owned.light, Light::Uniform(0)),
+            None => section.light.clone(),
         })
         .collect()
 }
@@ -2438,7 +2525,8 @@ mod tests {
                     &mut block,
                     &mut queue,
                     &mut SectionScratch::new(),
-                );
+                )
+                .expect("queue growth");
 
                 section.unpack(&mut ids);
                 let mut want_queue = Vec::new();

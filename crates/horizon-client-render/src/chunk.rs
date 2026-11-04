@@ -378,6 +378,34 @@ impl Light {
             (true, true) => Self::Full(light),
         }
     }
+    /// `packed` with fallible growth — the nibble layer is reserved
+    /// through `try_reserve`, so a heap at the wall gets `None` instead
+    /// of an abort. The input box is already allocated either way.
+    pub fn try_packed(light: Box<[u8; 4096]>) -> Option<Self> {
+        let first = light[0];
+        let (mut sky_varies, mut block_varies) = (false, false);
+        for &v in light.iter() {
+            let d = v ^ first;
+            sky_varies |= d & 0xF0 != 0;
+            block_varies |= d & 15 != 0;
+        }
+        let layer = |shift: u32| {
+            let mut v = Vec::new();
+            v.try_reserve_exact(2048).ok()?;
+            v.resize(2048, 0);
+            for (out, pair) in v.iter_mut().zip(light.as_chunks::<2>().0) {
+                *out = (pair[0] >> shift & 15) | (pair[1] >> shift & 15) << 4;
+            }
+            let layer: Box<[u8; 2048]> = v.into_boxed_slice().try_into().ok()?;
+            Some(layer)
+        };
+        match (sky_varies, block_varies) {
+            (false, false) => Some(Self::Uniform(first)),
+            (true, false) => Some(Self::Sky(layer(4)?, first & 15)),
+            (false, true) => Some(Self::Block(layer(0)?, first >> 4)),
+            (true, true) => Some(Self::Full(light)),
+        }
+    }
     /// The packed light of blocks `at..at + out.len()`, into `out`.
     #[inline]
     pub fn copy_run(&self, at: usize, out: &mut [u8]) {
