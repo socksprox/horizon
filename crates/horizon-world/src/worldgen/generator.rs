@@ -913,6 +913,17 @@ impl GeneratorData {
     ) -> Option<Arc<crate::block_collision::BlockCollisionRegistry<'static>>> {
         self.blocks.as_ref().map(|b| b.collision.clone())
     }
+    /// The `blocks/block-properties.nbt` `occlusion` table's decode —
+    /// `Some` until the first taker (then `None`, like the `blocks/`
+    /// decodes being absent). `FaceVisibility::new` reads the same
+    /// table for render: sharing this Arc decodes it once instead of
+    /// twice, and unlike `block_collision`'s resident share the
+    /// hand-off keeps no copy past the taker's own transient use.
+    pub fn take_block_occlusion(
+        &self,
+    ) -> Option<Arc<crate::collision::CachedCollisionRegistry<'static>>> {
+        self.blocks.as_ref()?.properties.take_occlusion()
+    }
     pub fn block_states(&self) -> &GenBlockStates {
         &self.states
     }

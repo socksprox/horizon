@@ -11,7 +11,7 @@ use horizon_core::geometry::{Direction, ShapeError, ShapeOp, VoxelShape};
 use std::{
     collections::{BTreeMap, HashMap},
     io,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -111,6 +111,12 @@ pub struct BlockPropertiesRegistry<'r> {
     definitions: BTreeMap<String, BlockDefinitionProperties>,
     states: Arc<[u8]>,
     occlusion_faces: BoundOcclusionFaces,
+    /// The `occlusion` table the flags were computed from, kept until a
+    /// second consumer takes it through [`Self::take_occlusion`]. The
+    /// table is transient for both of its readers — this registry at
+    /// build, `FaceVisibility` at its own — so the share hands the Arc
+    /// off rather than keep another resident copy.
+    occlusion: Mutex<Option<Arc<CachedCollisionRegistry<'r>>>>,
 }
 impl<'r> BlockPropertiesRegistry<'r> {
     pub fn from_nbt(tag: &Tag, collisions: &CachedCollisionRegistry<'r>) -> io::Result<Self> {
@@ -120,7 +126,7 @@ impl<'r> BlockPropertiesRegistry<'r> {
         )
     }
     pub fn from_table(
-        table: BlockTable<'_, '_>,
+        table: BlockTable<'_, 'r>,
         collisions: &CachedCollisionRegistry<'r>,
     ) -> io::Result<Self> {
         let registry = collisions.registry();
@@ -156,9 +162,9 @@ impl<'r> BlockPropertiesRegistry<'r> {
                 },
             );
         }
-        let occlusion = CachedCollisionRegistry::from_table(
+        let occlusion = Arc::new(CachedCollisionRegistry::from_table(
             table.nested("occlusion", "block occlusion shapes")?,
-        )?;
+        )?);
         let mut result = Vec::with_capacity(registry.len());
         let mut faces = Vec::with_capacity(registry.len());
         let mut face_cache = HashMap::new();
@@ -213,7 +219,21 @@ impl<'r> BlockPropertiesRegistry<'r> {
             occlusion_faces: BoundOcclusionFaces {
                 states: faces.into(),
             },
+            occlusion: Mutex::new(Some(occlusion)),
         })
+    }
+    /// The decoded `occlusion` table the flags were computed from —
+    /// `Some` until the first taker. A consumer that also reads this
+    /// table (render's `FaceVisibility::new`, over the same nested
+    /// `occlusion`/`occlusion.nbt` data) should share this Arc rather
+    /// than decode a second copy; both readers use it transiently, so
+    /// taking frees it with that consumer's drop instead of keeping a
+    /// resident copy nobody reads again.
+    pub fn take_occlusion(&self) -> Option<Arc<CachedCollisionRegistry<'r>>> {
+        self.occlusion
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
     pub fn bind_occlusion_faces(&self) -> BoundOcclusionFaces {
         self.occlusion_faces.clone()
