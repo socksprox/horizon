@@ -164,7 +164,8 @@ impl Decoration {
         source: &ResolvedBiomeSource,
         flat: Option<FlatDecoration>,
     ) -> Result<Option<Self>, GeneratorError> {
-        let Some(resources) = &data.feature_resources else {
+        let bundles = data.bundles()?;
+        let Some(resources) = &bundles.feature_resources else {
             return Ok(None);
         };
         let registry = data.registry();
@@ -190,7 +191,7 @@ impl Decoration {
         if let Some(structures) = &data.structures {
             bindings = bindings.with_structures(structures.clone());
         }
-        if let Some(blocks) = &resources.blocks {
+        if let Some(blocks) = &data.blocks {
             bindings = bindings
                 .with_block_properties(&blocks.properties)?
                 .with_state_providers(
@@ -449,10 +450,7 @@ impl Decoration {
             structure_mobs: worker.structure_mobs.clone(),
             starts: references.clone(),
             biome_names: data.biome_names(),
-            blocks: data
-                .feature_resources
-                .as_ref()
-                .and_then(|r| r.blocks.as_ref()),
+            blocks: data.blocks.as_ref(),
             region: terrain,
             biomes: BiomeRegion::new(biomes, obfuscate_seed(seed))
                 .map_err(|e| resource(e.to_string()))?,
@@ -671,10 +669,7 @@ impl Decoration {
             structure_mobs: None,
             starts: region[4].structure_starts.clone(),
             biome_names: data.biome_names(),
-            blocks: data
-                .feature_resources
-                .as_ref()
-                .and_then(|r| r.blocks.as_ref()),
+            blocks: data.blocks.as_ref(),
             region: terrain,
             biomes: BiomeRegion::new(biomes, obfuscate_seed(seed))
                 .map_err(|e| resource(e.to_string()))?,

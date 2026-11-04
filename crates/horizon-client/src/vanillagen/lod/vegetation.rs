@@ -83,7 +83,7 @@ fn gather(
         } else {
             data.configured_feature_json(name)
         };
-        if let Some(json) = json.and_then(|s| serde_json::from_str::<Value>(s).ok()) {
+        if let Some(json) = json.and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
             gather(data, &json, placed, count, depth + 1, out, chorus);
         }
         return;

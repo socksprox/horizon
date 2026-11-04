@@ -84,7 +84,8 @@ fn nested_features(
 impl LiveFeatures {
     /// None when the bundle carries no feature resources.
     pub fn new(data: &Arc<GeneratorData>) -> Result<Option<Self>, GeneratorError> {
-        let Some(resources) = &data.feature_resources else {
+        let bundles = data.bundles()?;
+        let Some(resources) = &bundles.feature_resources else {
             return Ok(None);
         };
         let registry = data.registry();
@@ -110,7 +111,7 @@ impl LiveFeatures {
         if let Some(structures) = &data.structures {
             bindings = bindings.with_structures(structures.clone());
         }
-        if let Some(blocks) = &resources.blocks {
+        if let Some(blocks) = &data.blocks {
             bindings = bindings
                 .with_block_properties(&blocks.properties)?
                 .with_state_providers(
@@ -232,7 +233,8 @@ impl LiveFeatures {
     /// Raw JSON of a configured feature (for configuration values such as a
     /// trunk placer's base height).
     pub fn configured_json(&self, name: &str) -> Option<Value> {
-        let resources = self.data.feature_resources.as_ref()?;
+        let bundles = self.data.bundles().ok()?;
+        let resources = bundles.feature_resources.as_ref()?;
         serde_json::from_str(resources.features.get(name)?).ok()
     }
     /// The structure templates and processor lists features place from.

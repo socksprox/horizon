@@ -256,7 +256,8 @@ impl StructureState {
         possible_biomes: &BTreeSet<BiomeId>,
         rings: Arc<OnceLock<Rings>>,
     ) -> Result<Option<Self>, GeneratorError> {
-        let (Some(resources), Some(raw)) = (&data.structures, &data.structure_resources) else {
+        let bundles = data.bundles()?;
+        let (Some(resources), Some(raw)) = (&data.structures, &bundles.structure_resources) else {
             return Ok(None);
         };
         let registry =
@@ -280,11 +281,7 @@ impl StructureState {
         }
         let mut bindings = data.feature_block_bindings()?;
         // Processors that test what a block is made of read canOcclude.
-        if let Some(blocks) = data
-            .feature_resources
-            .as_ref()
-            .and_then(|r| r.blocks.as_ref())
-        {
+        if let Some(blocks) = data.blocks.as_ref() {
             bindings = bindings.with_block_properties(&blocks.properties)?;
         }
         let zone_reach = registry.zone_reach();

@@ -148,8 +148,6 @@ pub(super) struct FeatureResources {
     pub(super) feature_tags: BTreeMap<String, String>,
     pub(super) fluid_tags: BTreeMap<String, Vec<String>>,
     pub(super) state_providers: BTreeMap<String, String>,
-    /// Block properties, support, collision and survival for placement checks.
-    pub(super) blocks: Option<super::generator_blocks::BlockBehavior>,
 }
 
 /// Raw structure, structure-set and template-pool resources.
@@ -159,24 +157,46 @@ pub(super) struct StructureBundles {
     pub(super) pools: BTreeMap<String, String>,
 }
 
+/// The raw bundle JSON a build decodes and generation never re-reads —
+/// the noise, density, material-rule, settings, preset and dimension
+/// tables plus the raw feature and structure maps. `Pipeline::new` and
+/// the decoration/structure catalogs consume it at build; afterwards it
+/// sits resident unread (~7 MB of the bundled overworld data), so a
+/// small-heap caller can hand it back with
+/// [`GeneratorData::release_bundles`]. The accessors that need it reload
+/// it from the bundle directory on demand: the cheap part of `load`
+/// (the bundle files are ~2.5 MB of reads and no decode), since the
+/// expensive decodes — `blocks/`, `structure/` and the tag tables —
+/// stay resident on `GeneratorData` either way.
+pub(super) struct Bundles {
+    pub(super) noises: Bundle,
+    pub(super) densities: Bundle,
+    pub(super) rules: Bundle,
+    pub(super) settings: Bundle,
+    pub(super) presets: Bundle,
+    pub(super) world_presets: Bundle,
+    pub(super) dimensions: Bundle,
+    pub(super) dimension_types: Bundle,
+    pub(super) feature_resources: Option<FeatureResources>,
+    pub(super) structure_resources: Option<StructureBundles>,
+}
+
 /// Seed-independent generation resources, loaded once and shared by every
 /// generator. Biome identities are indices into the sorted biome registry.
 pub struct GeneratorData {
     registry: &'static BlockRegistry,
     states: GenBlockStates,
     integers: BTreeSet<(String, String)>,
-    noises: BTreeMap<String, String>,
-    densities: BTreeMap<String, String>,
-    rules: BTreeMap<String, String>,
-    settings: BTreeMap<String, String>,
-    presets: BTreeMap<String, String>,
-    world_presets: BTreeMap<String, String>,
-    /// Data packs' level stems (`dimension/<id>.json`), by dimension id:
-    /// they replace the world preset's.
-    dimensions: BTreeMap<String, String>,
-    /// Data packs' dimension types (`dimension_type/<id>.json`), by id:
-    /// they replace the vanilla ones' build ranges.
-    dimension_types: BTreeMap<String, String>,
+    /// The directory `load`/`load_with` read — `bundles()`'s reload
+    /// source after a [`release_bundles`](Self::release_bundles).
+    bundle_dir: std::path::PathBuf,
+    /// The data-pack layer `load_with` merged — kept for the same
+    /// reload (`Bundle::read` applies it again).
+    overrides: WorldgenOverrides,
+    /// The raw bundle JSON, `None` after `release_bundles` — see
+    /// [`Bundles`]. `Mutex` because the `Arc<GeneratorData>` the
+    /// pipeline and every proto chunk share is immutable otherwise.
+    bundles: Mutex<Option<Bundles>>,
     /// What loading the data packs' entries left out, for the log.
     warnings: Vec<String>,
     conditions: MaterialConditionRegistry,
@@ -194,10 +214,13 @@ pub struct GeneratorData {
     /// decoration, structures and live features (`feature_block_bindings`).
     bound_block_tags: std::sync::OnceLock<super::block_feature::BoundBlockTags>,
     pub(super) biome_tags: BTreeMap<String, Vec<String>>,
-    pub(super) feature_resources: Option<FeatureResources>,
+    /// Block properties, support, collision and survival for placement
+    /// checks — `feature_resources`' decoded `blocks/` half, resident
+    /// (decorate reads it per chunk) where the raw maps moved into
+    /// `bundles`.
+    pub(super) blocks: Option<super::generator_blocks::BlockBehavior>,
     /// Templates, processor lists and per-state template transforms.
     pub(super) structures: Option<Arc<super::structure::StructureResources>>,
-    pub(super) structure_resources: Option<StructureBundles>,
     /// Block shape-update behaviour (`block-behaviours.json` next to the
     /// worldgen directory) for template placement's neighbor updates.
     pub(super) behaviours: Option<Arc<crate::level::Behaviours>>,
@@ -331,6 +354,106 @@ pub(crate) fn quantize_parameter_report(json: &str) -> Result<String, GeneratorE
         }));
     }
     Ok(Value::Array(entries).to_string())
+}
+/// `presets.json` plus the `biome_parameters/<name>.json` data-generator
+/// reports (each quantized into the preset table format, the prepared
+/// entries winning a name clash) — the multi-noise tables a biome
+/// source resolves against.
+fn read_presets(dir: &Path, ov: &WorldgenOverrides) -> Result<Bundle, GeneratorError> {
+    let mut presets = read_optional_bundle(dir, ov, "presets")?.unwrap_or_default();
+    let reports = dir.join("biome_parameters");
+    if reports.is_dir() {
+        for entry in fs::read_dir(&reports)? {
+            let path = entry?.path();
+            let Some(stem) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .filter(|_| path.extension().is_some_and(|e| e == "json"))
+            else {
+                continue;
+            };
+            presets
+                .entry(format!("minecraft:{stem}"))
+                .or_insert(quantize_parameter_report(&fs::read_to_string(&path)?)?);
+        }
+    }
+    Ok(presets)
+}
+impl Bundles {
+    /// The bundle files `load` reads — and [`GeneratorData::bundles`]'s
+    /// reload after a `release_bundles`: only the raw JSON tables a
+    /// build decodes, never the `blocks/` or `structure/` trees (those
+    /// decodes stay resident). Tag problems a rebuild surfaces go into
+    /// `warnings` — a reload passes a scratch list: the data's own
+    /// `warnings` was already written.
+    fn read(
+        dir: &Path,
+        ov: &WorldgenOverrides,
+        warnings: &mut Vec<String>,
+    ) -> Result<Self, GeneratorError> {
+        let fluid_tags = match read_optional_bundle(dir, ov, "fluid_tags")? {
+            Some(raw) => build_tags(&raw, ov, "fluid_tags", warnings, |id| {
+                matches!(
+                    id,
+                    "minecraft:water"
+                        | "minecraft:flowing_water"
+                        | "minecraft:lava"
+                        | "minecraft:flowing_lava"
+                        | "minecraft:empty"
+                )
+            })?,
+            None => BTreeMap::new(),
+        };
+        let feature_resources = match (
+            read_optional_bundle(dir, ov, "features")?,
+            read_optional_bundle(dir, ov, "placed_features")?,
+        ) {
+            (Some(features), Some(placed)) => Some(FeatureResources {
+                features,
+                placed,
+                feature_tags: read_optional_bundle(dir, ov, "feature_tags")?
+                    .unwrap_or_default(),
+                fluid_tags,
+                state_providers: read_optional_bundle(dir, ov, "state_providers")?
+                    .unwrap_or_default(),
+            }),
+            _ => None,
+        };
+        let structure_resources = match (
+            read_optional_bundle(dir, ov, "structures")?,
+            read_optional_bundle(dir, ov, "structure_sets")?,
+            read_optional_bundle(dir, ov, "template_pools")?,
+        ) {
+            (Some(structures), Some(sets), Some(pools)) => Some(StructureBundles {
+                structures,
+                sets,
+                pools,
+            }),
+            _ => None,
+        };
+        Ok(Self {
+            noises: read_bundle(dir, ov, "noises")?,
+            densities: read_bundle(dir, ov, "densities")?,
+            rules: read_bundle(dir, ov, "rules")?,
+            settings: read_bundle(dir, ov, "settings")?,
+            world_presets: read_bundle(dir, ov, "world_presets")?,
+            presets: read_presets(dir, ov)?,
+            dimensions: ov.apply(overrides::DIMENSIONS, BTreeMap::new()),
+            dimension_types: ov.apply(overrides::DIMENSION_TYPES, BTreeMap::new()),
+            feature_resources,
+            structure_resources,
+        })
+    }
+}
+/// The loaded [`Bundles`], lock-held: generation code reads the raw
+/// tables only while a build decodes them, so a guard is never held
+/// across `decoration_for`/`StructureState::new` — they take their own.
+pub(super) struct BundlesGuard<'a>(std::sync::MutexGuard<'a, Option<Bundles>>);
+impl std::ops::Deref for BundlesGuard<'_> {
+    type Target = Bundles;
+    fn deref(&self) -> &Bundles {
+        self.0.as_ref().expect("bundles held by the guard")
+    }
 }
 /// `load` on a thread of its own ("Worldgen loader").
 fn loading<T: Send + 'static>(
@@ -478,25 +601,16 @@ impl GeneratorData {
             &biome_set,
             &biome_tags,
         )?;
-        let mut presets = read_optional_bundle(dir, ov, "presets")?.unwrap_or_default();
-        let reports = dir.join("biome_parameters");
-        if reports.is_dir() {
-            for entry in fs::read_dir(&reports)? {
-                let path = entry?.path();
-                let Some(stem) = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .filter(|_| path.extension().is_some_and(|e| e == "json"))
-                else {
-                    continue;
-                };
-                presets
-                    .entry(format!("minecraft:{stem}"))
-                    .or_insert(quantize_parameter_report(&fs::read_to_string(&path)?)?);
-            }
-        }
-        let source_catalog =
-            BiomeSourceCatalog::new(&biome_set, &biome_tags, &presets.keys().cloned().collect())?;
+        // The raw bundle tables `Pipeline::new` decodes — `release_bundles`
+        // can drop them after a build and `bundles()` re-reads them here.
+        let mut bundles_warnings = Vec::new();
+        let bundles = Bundles::read(dir, ov, &mut bundles_warnings)?;
+        warnings.extend(bundles_warnings);
+        let source_catalog = BiomeSourceCatalog::new(
+            &biome_set,
+            &biome_tags,
+            &bundles.presets.keys().cloned().collect(),
+        )?;
         let carvers = CarverCatalog::from_json(&read_bundle(dir, ov, "carvers")?)?;
         let mut biome_names = Vec::new();
         let mut biome_ids = BTreeMap::new();
@@ -519,51 +633,26 @@ impl GeneratorData {
                 .collect(),
         )
         .map_err(|e| resource(format!("carving blocks: {e}")))?;
-        let feature_resources = match (
-            read_optional_bundle(dir, ov, "features")?,
-            read_optional_bundle(dir, ov, "placed_features")?,
-        ) {
-            (Some(features), Some(placed)) => Some(FeatureResources {
-                features,
-                placed,
-                feature_tags: read_optional_bundle(dir, ov, "feature_tags")?.unwrap_or_default(),
-                blocks: joined(blocks)?,
-                fluid_tags,
-                state_providers: read_optional_bundle(dir, ov, "state_providers")?
-                    .unwrap_or_default(),
-            }),
-            _ => None,
+        // The decoded `blocks/` tables stay resident where their bundle
+        // went into `bundles`: decorate's placement checks read them per
+        // chunk. Only a bundle that carries features has them at all.
+        let blocks = if bundles.feature_resources.is_some() {
+            joined(blocks)?
+        } else {
+            None
         };
         let structures = joined(structures)?;
-        let structure_resources = match (
-            read_optional_bundle(dir, ov, "structures")?,
-            read_optional_bundle(dir, ov, "structure_sets")?,
-            read_optional_bundle(dir, ov, "template_pools")?,
-        ) {
-            (Some(structures), Some(sets), Some(pools)) => Some(StructureBundles {
-                structures,
-                sets,
-                pools,
-            }),
-            _ => None,
-        };
         let behaviours = joined(behaviours);
         Ok(Arc::new(Self {
             behaviours,
-            structure_resources,
             structures,
             registry,
             states: GenBlockStates(states.into()),
             integers,
-            noises: read_bundle(dir, ov, "noises")?,
-            densities: read_bundle(dir, ov, "densities")?,
-            rules: read_bundle(dir, ov, "rules")?,
-            settings: read_bundle(dir, ov, "settings")?,
-            world_presets: read_bundle(dir, ov, "world_presets")?,
-            dimensions: ov.apply(overrides::DIMENSIONS, BTreeMap::new()),
-            dimension_types: ov.apply(overrides::DIMENSION_TYPES, BTreeMap::new()),
+            bundle_dir: dir.to_owned(),
+            overrides: ov.clone(),
+            bundles: Mutex::new(Some(bundles)),
             warnings,
-            presets,
             conditions,
             source_catalog,
             biome_names,
@@ -574,7 +663,7 @@ impl GeneratorData {
             carving_blocks,
             block_tags,
             biome_tags,
-            feature_resources,
+            blocks,
             ring_cache: Mutex::new(Vec::new()),
             decorations: Mutex::new(Vec::new()),
             old_chunk_facts: OnceLock::new(),
@@ -641,18 +730,23 @@ impl GeneratorData {
         preset: &str,
         dimension: &str,
     ) -> Result<(), GeneratorError> {
-        let preset_json: Value = serde_json::from_str(
-            self.world_presets
-                .get(preset)
-                .ok_or_else(|| resource(format!("missing world preset {preset}")))?,
-        )?;
-        let source_json =
-            preset_json["dimensions"][dimension]["generator"]["biome_source"].to_string();
-        let source = self
-            .source_catalog
-            .decode(&source_json)?
-            .resolve(&self.presets)
-            .map_err(|e| resource(format!("biome source: {e}")))?;
+        let (source_json, source) = {
+            let bundles = self.bundles()?;
+            let preset_json: Value = serde_json::from_str(
+                bundles
+                    .world_presets
+                    .get(preset)
+                    .ok_or_else(|| resource(format!("missing world preset {preset}")))?,
+            )?;
+            let source_json =
+                preset_json["dimensions"][dimension]["generator"]["biome_source"].to_string();
+            let source = self
+                .source_catalog
+                .decode(&source_json)?
+                .resolve(&bundles.presets)
+                .map_err(|e| resource(format!("biome source: {e}")))?;
+            (source_json, source)
+        };
         self.decoration_for(&source_json, &source).map(drop)
     }
     pub fn registry(&self) -> &'static BlockRegistry {
@@ -663,23 +757,53 @@ impl GeneratorData {
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
+    /// The raw bundle tables, loaded — re-read from `bundle_dir` first
+    /// when a [`release_bundles`](Self::release_bundles) dropped them.
+    /// Callers hold the guard only across the reads that need it: held
+    /// into `decoration_for`/`StructureState::new`, which take guards of
+    /// their own, it deadlocks.
+    pub(super) fn bundles(&self) -> Result<BundlesGuard<'_>, GeneratorError> {
+        let mut guard = self.bundles.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = Some(Bundles::read(
+                &self.bundle_dir,
+                &self.overrides,
+                &mut Vec::new(),
+            )?);
+        }
+        Ok(BundlesGuard(guard))
+    }
+    /// Free the raw bundle tables (~7 MB of the bundled overworld data)
+    /// a build decoded and generation never re-reads — a small-heap
+    /// host's post-build trim. Every use of them reloads the bundle
+    /// files on demand ([`bundles`](Self::bundles)), so the data still
+    /// builds another generator; only the `blocks/` and `structure/`
+    /// decodes such a build would have repeated stay resident.
+    pub fn release_bundles(&self) {
+        *self.bundles.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
     pub fn block_states(&self) -> &GenBlockStates {
         &self.states
     }
-    /// Biome identifiers in registry (identifier-sorted) order.
-    pub fn configured_feature_json(&self, name: &str) -> Option<&str> {
-        self.feature_resources
+    /// The configured feature's raw JSON — owned because the raw map may
+    /// sit behind a `release_bundles`d reload.
+    pub fn configured_feature_json(&self, name: &str) -> Option<String> {
+        self.bundles()
+            .ok()?
+            .feature_resources
             .as_ref()?
             .features
             .get(name)
-            .map(String::as_str)
+            .cloned()
     }
-    pub fn placed_feature_json(&self, name: &str) -> Option<&str> {
-        self.feature_resources
+    pub fn placed_feature_json(&self, name: &str) -> Option<String> {
+        self.bundles()
+            .ok()?
+            .feature_resources
             .as_ref()?
             .placed
             .get(name)
-            .map(String::as_str)
+            .cloned()
     }
     pub fn biome_names(&self) -> &[Arc<str>] {
         &self.biome_names
@@ -696,9 +820,8 @@ impl GeneratorData {
             };
             let (leaves, logs) = (members("minecraft:leaves"), members("minecraft:logs"));
             let collision = self
-                .feature_resources
+                .blocks
                 .as_ref()
-                .and_then(|resources| resources.blocks.as_ref())
                 .map(|blocks| &blocks.collision);
             let surface_names = [
                 "minecraft:podzol",
@@ -974,7 +1097,12 @@ pub struct FlatSettings {
     /// `lakes`: the lava lakes (`createLakesList`) take the biome's lakes step.
     pub lakes: bool,
 }
-const CACHE_LIMIT: usize = 16384;
+/// Biome-chunk cache cap — upstream's 16,384-entry map (~6 KB a chunk)
+/// could grow to ~100 MB over a long session; 64 covers several
+/// decorate hoods (9 each) at ~400 KB. On overflow the whole cache
+/// clears, so a cap this small only rebuilds climate samples, never
+/// results.
+const CACHE_LIMIT: usize = 64;
 /// What a generator's shared caches hold ([`OverworldGenerator::cache_census`]).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CacheCensus {
@@ -1076,7 +1204,11 @@ where
                 .unwrap_or(false),
         };
         let root = random.fork_positional();
-        let mut densities = DensityRegistry::from_json(&data.noises, &data.densities)?;
+        // The raw bundle tables this decodes — dropped before
+        // `decoration_for`/`StructureState::new`, which take guards of
+        // their own.
+        let bundles = data.bundles()?;
+        let mut densities = DensityRegistry::from_json(&bundles.noises, &bundles.densities)?;
         let router =
             NoiseRouter::from_json(&settings_json["noise_router"].to_string(), &mut densities)?;
         // NoiseGeneratorSettings.debugFunctions: a registered density or an
@@ -1105,7 +1237,7 @@ where
             .map(|v| AquiferConfig::from_json(&v.to_string(), &mut densities))
             .transpose()?;
         let mut library = MaterialRuleLibrary::from_json(
-            &data.rules,
+            &bundles.rules,
             &data.conditions,
             &codec,
             densities,
@@ -1151,11 +1283,11 @@ where
         let source = data
             .source_catalog
             .decode(&source_json)?
-            .resolve(&data.presets)
+            .resolve(&bundles.presets)
             .map_err(|e| resource(format!("biome source: {e}")))?;
         let climate = router.climate_sampler();
         let mut noises = BTreeMap::new();
-        for (name, json) in &data.noises {
+        for (name, json) in &bundles.noises {
             let noise: Arc<dyn Noise> = Arc::new(
                 decode_noise(json)?
                     .create(&mut root.from_hash_of(name))
@@ -1163,6 +1295,10 @@ where
             );
             noises.insert(name.clone(), noise);
         }
+        // The raw tables end here — `Self` moves `data`, and
+        // `decoration_for`/`StructureState::new` below take bundle
+        // guards of their own, which would deadlock under this one.
+        drop(bundles);
         let noise = |name: &str| -> Result<Arc<dyn Noise>, GeneratorError> {
             noises
                 .get(name)
@@ -3395,7 +3531,7 @@ impl OverworldGenerator {
     /// The overworld without structures (no starts, terrain adaptation or
     /// structure pieces), as in a world with structure generation disabled.
     pub fn without_structures(data: Arc<GeneratorData>, seed: i64) -> Result<Self, GeneratorError> {
-        Self::build(data, seed, "minecraft:normal", "minecraft:overworld", false, None)
+        Self::build(data, seed, "minecraft:normal", "minecraft:overworld", false, None, None)
     }
     /// Any noise-generator dimension of a bundled world preset.
     pub fn for_dimension(
@@ -3404,7 +3540,7 @@ impl OverworldGenerator {
         preset: &str,
         dimension: &str,
     ) -> Result<Self, GeneratorError> {
-        Self::build(data, seed, preset, dimension, true, None)
+        Self::build(data, seed, preset, dimension, true, None, None)
     }
     /// A superflat overworld (`FlatLevelSource`): the layers where the terrain would be, a
     /// fixed biome, and the structure sets `structure_overrides` allows (every one when it
@@ -3416,15 +3552,17 @@ impl OverworldGenerator {
         structures: bool,
     ) -> Result<Self, GeneratorError> {
         let registry = data.registry;
+        let bundles = data.bundles()?;
         let (level_min_y, level_height) = overrides::LevelHeight::of_type(
             &Value::from("minecraft:overworld"),
-            &data.dimension_types,
+            &bundles.dimension_types,
         )
         .map_or((-64, 384), |h| (h.min_y, h.height));
         // The overworld's own noise settings give the level its sea level and the rest of
         // the generator its data; no noise is ever sampled.
         let settings_json: Value = serde_json::from_str(
-            data.settings
+            bundles
+                .settings
                 .get("minecraft:overworld")
                 .ok_or_else(|| resource("missing noise settings minecraft:overworld"))?,
         )?;
@@ -3440,6 +3578,9 @@ impl OverworldGenerator {
             "biome_source": { "type": "minecraft:fixed", "biome": biome },
             "structure_overrides": flat.structure_overrides,
         });
+        // `Pipeline::new` takes its own bundle guard — holding this one
+        // across it would deadlock.
+        drop(bundles);
         let mut pipeline = Pipeline::new(
             data.clone(),
             seed,
@@ -3521,7 +3662,7 @@ impl OverworldGenerator {
         dimension: &str,
         structures: bool,
     ) -> Result<Self, GeneratorError> {
-        Self::build(data, seed, preset, dimension, structures, None)
+        Self::build(data, seed, preset, dimension, structures, None, None)
     }
     /// `for_world` with the stem generator's `biome_source` replaced by a
     /// fixed source of `biome` (`{"type":"minecraft:fixed","biome":…}`) — the
@@ -3537,17 +3678,7 @@ impl OverworldGenerator {
         biome: Option<&str>,
         structures: bool,
     ) -> Result<Self, GeneratorError> {
-        Self::build(data, seed, preset, dimension, structures, biome)
-    }
-    fn build(
-        data: Arc<GeneratorData>,
-        seed: i64,
-        preset: &str,
-        dimension: &str,
-        with_structures: bool,
-        fixed_biome: Option<&str>,
-    ) -> Result<Self, GeneratorError> {
-        Self::for_world_with_settings(data, seed, preset, dimension, with_structures, None)
+        Self::build(data, seed, preset, dimension, structures, None, biome)
     }
     /// A saved level stem supplies the generator and dimension type when no data
     /// pack replaces that dimension. Worlds without one use the preset's stem.
@@ -3559,13 +3690,26 @@ impl OverworldGenerator {
         with_structures: bool,
         saved_stem: Option<&Value>,
     ) -> Result<Self, GeneratorError> {
-        let stem = if let Some(json) = data.dimensions.get(dimension) {
+        Self::build(data, seed, preset, dimension, with_structures, saved_stem, None)
+    }
+    fn build(
+        data: Arc<GeneratorData>,
+        seed: i64,
+        preset: &str,
+        dimension: &str,
+        with_structures: bool,
+        saved_stem: Option<&Value>,
+        fixed_biome: Option<&str>,
+    ) -> Result<Self, GeneratorError> {
+        let bundles = data.bundles()?;
+        let stem = if let Some(json) = bundles.dimensions.get(dimension) {
             serde_json::from_str(json)?
         } else if let Some(stem) = saved_stem {
             stem.clone()
         } else {
             let preset_json: Value = serde_json::from_str(
-                data.world_presets
+                bundles
+                    .world_presets
                     .get(preset)
                     .ok_or_else(|| resource(format!("missing world preset {preset}")))?,
             )?;
@@ -3581,14 +3725,15 @@ impl OverworldGenerator {
         }
         // The level's build range: its dimension type's, a data pack's
         // over the vanilla one.
-        let level = overrides::LevelHeight::of_type(&stem["type"], &data.dimension_types)
+        let level = overrides::LevelHeight::of_type(&stem["type"], &bundles.dimension_types)
             .map(|h| (h.min_y, h.height));
         if generator["type"].as_str() != Some("minecraft:noise") {
             return Err(resource(format!("{dimension} is not a noise generator")));
         }
         let mut settings_json: Value = match &generator["settings"] {
             Value::String(name) => serde_json::from_str(
-                data.settings
+                bundles
+                    .settings
                     .get(name)
                     .ok_or_else(|| resource(format!("missing noise settings {name}")))?,
             )?,
@@ -3612,6 +3757,9 @@ impl OverworldGenerator {
                 noise_clamped = Some((noise, clamped));
             }
         }
+        // `Pipeline::new` takes its own bundle guard — holding this one
+        // across it would deadlock.
+        drop(bundles);
         let pipeline: Arc<dyn SeededPipeline> = if settings_json["legacy_random_source"]
             .as_bool()
             .unwrap_or(false)
@@ -3909,6 +4057,9 @@ impl GeneratorWorker {
         state.carver_biomes = HashMap::new();
         state.structure_biomes = HashMap::new();
         state.heights = HashMap::new();
+        // The terrain fill's thread-local density scratch (~400 KiB a
+        // worker thread, never otherwise freed).
+        super::terrain::release_density_scratch();
     }
 }
 
@@ -3986,11 +4137,13 @@ mod tests {
         let registry = Box::leak(Box::new(crate::level::data::load_registry(&root).unwrap()));
         let dir = root.join("worldgen");
         let vanilla = GeneratorData::load(&dir, registry).unwrap();
+        let bundles = vanilla.bundles().unwrap();
         let mut settings: Value =
-            serde_json::from_str(&vanilla.settings["minecraft:overworld"]).unwrap();
+            serde_json::from_str(&bundles.settings["minecraft:overworld"]).unwrap();
         settings["noise"]["height"] = 2096.into();
         let preset: Value =
-            serde_json::from_str(&vanilla.world_presets["minecraft:normal"]).unwrap();
+            serde_json::from_str(&bundles.world_presets["minecraft:normal"]).unwrap();
+        drop(bundles);
         let mut stem = preset["dimensions"]["minecraft:overworld"].clone();
         stem["generator"]["settings"] = "horizon:tall".into();
         let mut ov = WorldgenOverrides::default();
@@ -4024,8 +4177,11 @@ mod tests {
         }
         let registry = Box::leak(Box::new(crate::level::data::load_registry(&root).unwrap()));
         let data = GeneratorData::load(&root.join("worldgen"), registry).unwrap();
-        let preset: Value = serde_json::from_str(&data.world_presets["minecraft:normal"]).unwrap();
-        let settings: Value = serde_json::from_str(&data.settings["minecraft:end"]).unwrap();
+        let preset: Value =
+            serde_json::from_str(&data.bundles().unwrap().world_presets["minecraft:normal"])
+                .unwrap();
+        let settings: Value =
+            serde_json::from_str(&data.bundles().unwrap().settings["minecraft:end"]).unwrap();
         let mut pipeline = Pipeline::new(
             data.clone(),
             12345,
@@ -4755,11 +4911,15 @@ mod tests {
             crate::level::data::load_registry(&root).expect("registry"),
         ));
         let data = GeneratorData::load(&root.join("worldgen"), registry).expect("worldgen data");
-        let preset: Value = serde_json::from_str(&data.world_presets["minecraft:normal"]).unwrap();
+        let bundles = data.bundles().expect("bundles");
+        let preset: Value =
+            serde_json::from_str(&bundles.world_presets["minecraft:normal"]).unwrap();
         let generator_json = &preset["dimensions"]["minecraft:overworld"]["generator"];
         let settings: Value =
-            serde_json::from_str(&data.settings[generator_json["settings"].as_str().unwrap()])
+            serde_json::from_str(&bundles.settings[generator_json["settings"].as_str().unwrap()])
                 .unwrap();
+        // `Pipeline::new` takes its own guard.
+        drop(bundles);
         let generator = OverworldGenerator {
             pipeline: Arc::new(
                 Pipeline::new(
@@ -4832,11 +4992,14 @@ mod tests {
             crate::level::data::load_registry(&root).expect("registry"),
         ));
         let data = GeneratorData::load(&root.join("worldgen"), registry).expect("worldgen data");
-        let preset: Value = serde_json::from_str(&data.world_presets["minecraft:normal"]).unwrap();
-        let generator_json = &preset["dimensions"]["minecraft:overworld"]["generator"];
-        let settings: Value =
-            serde_json::from_str(&data.settings[generator_json["settings"].as_str().unwrap()])
+        let preset: Value =
+            serde_json::from_str(&data.bundles().unwrap().world_presets["minecraft:normal"])
                 .unwrap();
+        let generator_json = &preset["dimensions"]["minecraft:overworld"]["generator"];
+        let settings: Value = serde_json::from_str(
+            &data.bundles().unwrap().settings[generator_json["settings"].as_str().unwrap()],
+        )
+        .unwrap();
         let pipeline = Arc::new(
             Pipeline::new(
                 data,

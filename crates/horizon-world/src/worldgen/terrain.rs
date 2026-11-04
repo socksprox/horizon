@@ -21,6 +21,14 @@ thread_local! {
     static SCRATCH_DENSITY: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Free this thread's density scratch (up to ~400 KiB once `fill_noise`
+/// has sized it) — idle hosts hand it back; the next fill regrows it.
+/// `GeneratorWorker::release` calls it after giving the context
+/// scratch back.
+pub fn release_density_scratch() {
+    SCRATCH_DENSITY.with_borrow_mut(|scratch| *scratch = Vec::new());
+}
+
 /// Behavior and resolved tags for every state in the chunk's immutable registry.
 pub trait TerrainBlockStates {
     type State: HeightmapState;
