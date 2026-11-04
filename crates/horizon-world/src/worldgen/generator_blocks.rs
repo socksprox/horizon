@@ -102,15 +102,24 @@ impl BlockBehavior {
             return Ok(None);
         }
         let read = |name: &str| -> Result<BlockTableFile<'static>, GeneratorError> {
-            BlockTableFile::open(&dir.join(name), registry)
-                .map_err(|e| resource(format!("{name}: {e}")))
+            // The `.nbt` tables are tens of MB each: on the 3DS's
+            // fragmented app heap the backing file read's contiguous
+            // alloc can legitimately fail. Keep that kind distinguishable
+            // (`Io`/`OutOfMemory`) so the caller can degrade to "no
+            // behavior tables" — `blocks` is `Option` by design —
+            // instead of failing the whole generator-data load. Other
+            // errors (missing, corrupt) still fail it.
+            BlockTableFile::open(&dir.join(name), registry).map_err(|e| match e.kind() {
+                std::io::ErrorKind::OutOfMemory => GeneratorError::Io(e),
+                _ => resource(format!("{name}: {e}")),
+            })
         };
         let json = |name: &str| -> Result<Value, GeneratorError> {
             Ok(serde_json::from_str(&fs::read_to_string(dir.join(name))?)?)
         };
         // The support table reads on its own thread while the collision and
         // property tables (which need the collisions) read on this one.
-        let (collisions, properties, support) = std::thread::scope(|scope| {
+        let (collisions, properties, support) = match std::thread::scope(|scope| {
             let support = scope.spawn(|| -> Result<_, GeneratorError> {
                 Ok(BlockSupportRegistry::from_table(
                     read("cached-support.nbt")?.table("support")?,
@@ -127,7 +136,13 @@ impl BlockBehavior {
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic))?;
             Ok::<_, GeneratorError>((collisions, properties, Arc::new(support)))
-        })?;
+        }) {
+            Ok(v) => v,
+            Err(GeneratorError::Io(e)) if e.kind() == std::io::ErrorKind::OutOfMemory => {
+                return Ok(None)
+            }
+            Err(e) => return Err(e),
+        };
         let collision = Arc::new(BlockCollisionRegistry::new(Arc::new(collisions))?);
         let rules = json("survival-rules.json")?
             .as_object()
