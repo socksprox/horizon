@@ -190,6 +190,9 @@ pub struct GeneratorData {
     /// The directory `load`/`load_with` read — `bundles()`'s reload
     /// source after a [`release_bundles`](Self::release_bundles).
     bundle_dir: std::path::PathBuf,
+    /// The packed source `load_packed` read — kept for the same reload,
+    /// beside `bundle_dir`'s files (each lookup falls through to them).
+    packed: Option<Arc<dyn PackedWorldgen>>,
     /// The data-pack layer `load_with` merged — kept for the same
     /// reload (`Bundle::read` applies it again).
     overrides: WorldgenOverrides,
@@ -246,12 +249,54 @@ type DecorationSlot =
 /// Biome sources whose decoration is kept: the three dimensions and a spare.
 const DECORATION_CACHE_LIMIT: usize = 4;
 type Bundle = BTreeMap<String, String>;
+/// A prepare-packed mirror of `worldgen/` — Skyline's `skyline-data.bin`
+/// supplies each file's decoded payload so `serde_json` never parses on a
+/// small heap. Every method returns `Option`: `None` falls through to the
+/// filesystem read [`GeneratorData::load`] performs, so a pack missing a
+/// section degrades file by file rather than failing the load.
+pub trait PackedWorldgen: Send + Sync {
+    /// `worldgen/<name>.json` as its name→JSON-text bundle — the file's
+    /// decoded form (a `serde_json::from_str::<BTreeMap<String, String>>`
+    /// result, not its bytes).
+    fn bundle(&self, name: &str) -> Option<Bundle> {
+        let _ = name;
+        None
+    }
+    /// `worldgen/<rel>.json` decoded as a `serde_json::Value` — for files
+    /// that are not name→text bundles (`blocks/survival-rules.json`,
+    /// `blocks/structure-blocks.json`, ...).
+    fn value(&self, rel: &str) -> Option<Value> {
+        let _ = rel;
+        None
+    }
+    /// `worldgen/<rel>`'s raw bytes — the `.nbt` tables pass through
+    /// unchanged.
+    fn bytes(&self, rel: &str) -> Option<Vec<u8>> {
+        let _ = rel;
+        None
+    }
+    /// `worldgen/block_flags.json` decoded — per-state `[air, fluid]`.
+    fn flags(&self) -> Option<Vec<(bool, bool)>> {
+        None
+    }
+    /// Whether `worldgen/<rel>` exists in the pack: `Some` answers the
+    /// `exists()` checks (the pack is authoritative), `None` falls
+    /// through to the filesystem.
+    fn has(&self, rel: &str) -> Option<bool> {
+        let _ = rel;
+        None
+    }
+}
 /// The bundle `name` with the data packs' entries over it.
 fn read_bundle(
     dir: &Path,
     overrides: &WorldgenOverrides,
+    src: Option<&dyn PackedWorldgen>,
     name: &str,
 ) -> Result<Bundle, GeneratorError> {
+    if let Some(bundle) = src.and_then(|src| src.bundle(name)) {
+        return Ok(overrides.apply(name, bundle));
+    }
     let path = dir.join(format!("{name}.json"));
     let text =
         fs::read_to_string(&path).map_err(|e| resource(format!("{}: {e}", path.display())))?;
@@ -260,12 +305,19 @@ fn read_bundle(
 fn read_optional_bundle(
     dir: &Path,
     overrides: &WorldgenOverrides,
+    src: Option<&dyn PackedWorldgen>,
     name: &str,
 ) -> Result<Option<Bundle>, GeneratorError> {
-    if dir.join(format!("{name}.json")).exists() {
-        read_bundle(dir, overrides, name).map(Some)
-    } else {
-        Ok(None)
+    if let Some(bundle) = src.and_then(|src| src.bundle(name)) {
+        return Ok(Some(overrides.apply(name, bundle)));
+    }
+    match src.and_then(|src| src.has(&format!("{name}.json"))) {
+        // The pack answers authoritatively that the file is absent.
+        Some(false) => Ok(None),
+        _ if dir.join(format!("{name}.json")).exists() => {
+            read_bundle(dir, overrides, src, name).map(Some)
+        }
+        _ => Ok(None),
     }
 }
 /// The tags of the bundle `name`, the data packs' tag files after the
@@ -359,9 +411,19 @@ pub(crate) fn quantize_parameter_report(json: &str) -> Result<String, GeneratorE
 /// reports (each quantized into the preset table format, the prepared
 /// entries winning a name clash) — the multi-noise tables a biome
 /// source resolves against.
-fn read_presets(dir: &Path, ov: &WorldgenOverrides) -> Result<Bundle, GeneratorError> {
-    let mut presets = read_optional_bundle(dir, ov, "presets")?.unwrap_or_default();
+fn read_presets(
+    dir: &Path,
+    ov: &WorldgenOverrides,
+    src: Option<&dyn PackedWorldgen>,
+) -> Result<Bundle, GeneratorError> {
+    let mut presets = read_optional_bundle(dir, ov, src, "presets")?.unwrap_or_default();
     let reports = dir.join("biome_parameters");
+    // A pack's presets already fold the reports in (the writer merges
+    // them at bake time): parsing them again would re-quantize 3 MB of
+    // JSON into entries `or_insert` then discards.
+    if src.is_some_and(|src| src.has("presets.json") == Some(true)) {
+        return Ok(presets);
+    }
     if reports.is_dir() {
         for entry in fs::read_dir(&reports)? {
             let path = entry?.path();
@@ -389,9 +451,10 @@ impl Bundles {
     fn read(
         dir: &Path,
         ov: &WorldgenOverrides,
+        src: Option<&dyn PackedWorldgen>,
         warnings: &mut Vec<String>,
     ) -> Result<Self, GeneratorError> {
-        let fluid_tags = match read_optional_bundle(dir, ov, "fluid_tags")? {
+        let fluid_tags = match read_optional_bundle(dir, ov, src, "fluid_tags")? {
             Some(raw) => build_tags(&raw, ov, "fluid_tags", warnings, |id| {
                 matches!(
                     id,
@@ -405,24 +468,24 @@ impl Bundles {
             None => BTreeMap::new(),
         };
         let feature_resources = match (
-            read_optional_bundle(dir, ov, "features")?,
-            read_optional_bundle(dir, ov, "placed_features")?,
+            read_optional_bundle(dir, ov, src, "features")?,
+            read_optional_bundle(dir, ov, src, "placed_features")?,
         ) {
             (Some(features), Some(placed)) => Some(FeatureResources {
                 features,
                 placed,
-                feature_tags: read_optional_bundle(dir, ov, "feature_tags")?
+                feature_tags: read_optional_bundle(dir, ov, src, "feature_tags")?
                     .unwrap_or_default(),
                 fluid_tags,
-                state_providers: read_optional_bundle(dir, ov, "state_providers")?
+                state_providers: read_optional_bundle(dir, ov, src, "state_providers")?
                     .unwrap_or_default(),
             }),
             _ => None,
         };
         let structure_resources = match (
-            read_optional_bundle(dir, ov, "structures")?,
-            read_optional_bundle(dir, ov, "structure_sets")?,
-            read_optional_bundle(dir, ov, "template_pools")?,
+            read_optional_bundle(dir, ov, src, "structures")?,
+            read_optional_bundle(dir, ov, src, "structure_sets")?,
+            read_optional_bundle(dir, ov, src, "template_pools")?,
         ) {
             (Some(structures), Some(sets), Some(pools)) => Some(StructureBundles {
                 structures,
@@ -432,12 +495,12 @@ impl Bundles {
             _ => None,
         };
         Ok(Self {
-            noises: read_bundle(dir, ov, "noises")?,
-            densities: read_bundle(dir, ov, "densities")?,
-            rules: read_bundle(dir, ov, "rules")?,
-            settings: read_bundle(dir, ov, "settings")?,
-            world_presets: read_bundle(dir, ov, "world_presets")?,
-            presets: read_presets(dir, ov)?,
+            noises: read_bundle(dir, ov, src, "noises")?,
+            densities: read_bundle(dir, ov, src, "densities")?,
+            rules: read_bundle(dir, ov, src, "rules")?,
+            settings: read_bundle(dir, ov, src, "settings")?,
+            world_presets: read_bundle(dir, ov, src, "world_presets")?,
+            presets: read_presets(dir, ov, src)?,
             dimensions: ov.apply(overrides::DIMENSIONS, BTreeMap::new()),
             dimension_types: ov.apply(overrides::DIMENSION_TYPES, BTreeMap::new()),
             feature_resources,
@@ -490,20 +553,46 @@ impl GeneratorData {
         registry: &'static BlockRegistry,
         ov: &WorldgenOverrides,
     ) -> Result<Arc<Self>, GeneratorError> {
+        Self::load_source(dir, registry, ov, None)
+    }
+    /// `load_with`, reading `dir`'s files through `src` first — a
+    /// prepare-packed mirror (see [`PackedWorldgen`]) that returns each
+    /// file's decoded payload. Sections the pack does not answer still
+    /// read `dir` unchanged; the pack rides along for [`bundles`]'s
+    /// `release_bundles` reloads.
+    pub fn load_packed(
+        dir: &Path,
+        registry: &'static BlockRegistry,
+        ov: &WorldgenOverrides,
+        src: Arc<dyn PackedWorldgen>,
+    ) -> Result<Arc<Self>, GeneratorError> {
+        Self::load_source(dir, registry, ov, Some(src))
+    }
+    fn load_source(
+        dir: &Path,
+        registry: &'static BlockRegistry,
+        ov: &WorldgenOverrides,
+        packed: Option<Arc<dyn PackedWorldgen>>,
+    ) -> Result<Arc<Self>, GeneratorError> {
+        let src = packed.as_deref();
         let mut warnings = Vec::new();
-        let flags: Vec<(bool, bool)> =
-            serde_json::from_str(&fs::read_to_string(dir.join("block_flags.json"))?)?;
+        let flags: Vec<(bool, bool)> = match src.and_then(|src| src.flags()) {
+            Some(flags) => flags,
+            None => {
+                serde_json::from_str(&fs::read_to_string(dir.join("block_flags.json"))?)?
+            }
+        };
         if flags.len() != registry.len() {
             return Err(resource("block_flags.json does not match the registry"));
         }
         let block_tags = build_tags(
-            &read_bundle(dir, ov, "block_tags")?,
+            &read_bundle(dir, ov, src, "block_tags")?,
             ov,
             "block_tags",
             &mut warnings,
             |id| registry.default_state(id).is_some(),
         )?;
-        let fluid_tags = match read_optional_bundle(dir, ov, "fluid_tags")? {
+        let fluid_tags = match read_optional_bundle(dir, ov, src, "fluid_tags")? {
             Some(raw) => build_tags(&raw, ov, "fluid_tags", &mut warnings, |id| {
                 matches!(
                     id,
@@ -521,13 +610,34 @@ impl GeneratorData {
         // their own while this one reads the rest. A new world's first chunks
         // wait for all of it, with the chunk workers idle.
         let blocks = loading({
-            let (dir, tags, fluids) = (dir.join("blocks"), block_tags.clone(), fluid_tags.clone());
-            move || super::generator_blocks::BlockBehavior::load(&dir, registry, &tags, &fluids)
+            let (dir, tags, fluids, packed) = (
+                dir.join("blocks"),
+                block_tags.clone(),
+                fluid_tags.clone(),
+                packed.clone(),
+            );
+            move || {
+                super::generator_blocks::BlockBehavior::load(
+                    &dir,
+                    registry,
+                    &tags,
+                    &fluids,
+                    packed.as_deref(),
+                )
+            }
         })?;
         let structures = loading({
-            let (dir, tags, ov) = (dir.to_owned(), block_tags.clone(), ov.clone());
+            let (dir, tags, ov, packed) =
+                (dir.to_owned(), block_tags.clone(), ov.clone(), packed.clone());
             move || -> Result<_, GeneratorError> {
-                let Ok(json) = fs::read_to_string(dir.join("blocks/structure-blocks.json")) else {
+                let src = packed.as_deref();
+                let json = match src.and_then(|src| src.bytes("blocks/structure-blocks.json")) {
+                    Some(bytes) => Some(String::from_utf8(bytes).map_err(|_| {
+                        resource("blocks/structure-blocks.json is not UTF-8")
+                    })?),
+                    None => fs::read_to_string(dir.join("blocks/structure-blocks.json")).ok(),
+                };
+                let Some(json) = json else {
                     return Ok(None);
                 };
                 Ok(Some(Arc::new(
@@ -535,7 +645,8 @@ impl GeneratorData {
                         registry,
                         super::structure::StateTransforms::from_json(&json, registry.len())?,
                         &dir.join("structure"),
-                        read_optional_bundle(&dir, &ov, "processor_lists")?.unwrap_or_default(),
+                        read_optional_bundle(&dir, &ov, src, "processor_lists")?
+                            .unwrap_or_default(),
                         &tags,
                     )
                     .with_pack_templates(ov.templates().clone()),
@@ -587,9 +698,9 @@ impl GeneratorData {
             .into_iter()
             .filter_map(|(key, integer)| integer.then_some(key))
             .collect();
-        let biomes = read_bundle(dir, ov, "biomes")?;
+        let biomes = read_bundle(dir, ov, src, "biomes")?;
         let biome_tags = build_tags(
-            &read_bundle(dir, ov, "biome_tags")?,
+            &read_bundle(dir, ov, src, "biome_tags")?,
             ov,
             "biome_tags",
             &mut warnings,
@@ -597,21 +708,21 @@ impl GeneratorData {
         )?;
         let biome_set = biomes.keys().cloned().collect::<BTreeSet<_>>();
         let conditions = MaterialConditionRegistry::from_json_with_biome_tags(
-            &read_bundle(dir, ov, "conditions")?,
+            &read_bundle(dir, ov, src, "conditions")?,
             &biome_set,
             &biome_tags,
         )?;
         // The raw bundle tables `Pipeline::new` decodes — `release_bundles`
         // can drop them after a build and `bundles()` re-reads them here.
         let mut bundles_warnings = Vec::new();
-        let bundles = Bundles::read(dir, ov, &mut bundles_warnings)?;
+        let bundles = Bundles::read(dir, ov, src, &mut bundles_warnings)?;
         warnings.extend(bundles_warnings);
         let source_catalog = BiomeSourceCatalog::new(
             &biome_set,
             &biome_tags,
             &bundles.presets.keys().cloned().collect(),
         )?;
-        let carvers = CarverCatalog::from_json(&read_bundle(dir, ov, "carvers")?)?;
+        let carvers = CarverCatalog::from_json(&read_bundle(dir, ov, src, "carvers")?)?;
         let mut biome_names = Vec::new();
         let mut biome_ids = BTreeMap::new();
         let mut biome_json = Vec::new();
@@ -650,6 +761,7 @@ impl GeneratorData {
             states: GenBlockStates(states.into()),
             integers,
             bundle_dir: dir.to_owned(),
+            packed,
             overrides: ov.clone(),
             bundles: Mutex::new(Some(bundles)),
             warnings,
@@ -768,6 +880,7 @@ impl GeneratorData {
             *guard = Some(Bundles::read(
                 &self.bundle_dir,
                 &self.overrides,
+                self.packed.as_deref(),
                 &mut Vec::new(),
             )?);
         }

@@ -97,8 +97,13 @@ impl BlockBehavior {
         registry: &'static BlockRegistry,
         tags: &BTreeMap<String, Vec<String>>,
         fluid_tags: &BTreeMap<String, Vec<String>>,
+        src: Option<&dyn super::generator::PackedWorldgen>,
     ) -> Result<Option<Self>, GeneratorError> {
-        if !dir.join("block-properties.nbt").exists() {
+        let has = |name: &str| match src.and_then(|src| src.has(&format!("blocks/{name}"))) {
+            Some(has) => has,
+            None => dir.join(name).exists(),
+        };
+        if !has("block-properties.nbt") {
             return Ok(None);
         }
         let read = |name: &str| -> Result<BlockTableFile<'static>, GeneratorError> {
@@ -109,13 +114,20 @@ impl BlockBehavior {
             // behavior tables" — `blocks` is `Option` by design —
             // instead of failing the whole generator-data load. Other
             // errors (missing, corrupt) still fail it.
-            BlockTableFile::open(&dir.join(name), registry).map_err(|e| match e.kind() {
+            let translate = |e: std::io::Error| match e.kind() {
                 std::io::ErrorKind::OutOfMemory => GeneratorError::Io(e),
                 _ => resource(format!("{name}: {e}")),
-            })
+            };
+            match src.and_then(|src| src.bytes(&format!("blocks/{name}"))) {
+                Some(bytes) => BlockTableFile::read(&bytes, registry).map_err(translate),
+                None => BlockTableFile::open(&dir.join(name), registry).map_err(translate),
+            }
         };
         let json = |name: &str| -> Result<Value, GeneratorError> {
-            Ok(serde_json::from_str(&fs::read_to_string(dir.join(name))?)?)
+            match src.and_then(|src| src.value(&format!("blocks/{name}"))) {
+                Some(value) => Ok(value),
+                None => Ok(serde_json::from_str(&fs::read_to_string(dir.join(name))?)?),
+            }
         };
         // The support table reads on its own thread while the collision and
         // property tables (which need the collisions) read on this one.
