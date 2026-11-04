@@ -1117,7 +1117,7 @@ impl GeneratorData {
     pub fn take_block_occlusion(
         &self,
     ) -> Option<Arc<crate::collision::CachedCollisionRegistry<'static>>> {
-        self.blocks.as_ref()?.properties.take_occlusion()
+        self.blocks().ok()??.properties.take_occlusion()
     }
     pub fn block_states(&self) -> &GenBlockStates {
         &self.states
