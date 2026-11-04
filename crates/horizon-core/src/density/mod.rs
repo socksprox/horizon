@@ -174,6 +174,59 @@ fn check_exact_buffer(buffer: &[f32], volume: DensityVolume) -> Result<(), Sampl
         Ok(())
     }
 }
+
+/// Default y-span for [`sample_volume_sliced`]: a quarter of the overworld's
+/// 384-block column — slice buffers ~96 KiB where the full volume wants ~384.
+pub const DEFAULT_SLICE_Y: usize = 96;
+
+/// `sampler.sample_volume` evaluated in horizontal y-slices scattered into
+/// `out`. Sampler-internal buffers — context scratch and cache cells — are
+/// all volume-sized, so a slice bound of e.g. a quarter of `volume`'s height
+/// keeps them that fraction of the full-column size (a 3DS generating
+/// worker's retained scratch drops from ~4 MiB toward ~1 MiB).
+///
+/// Density values are position-pure: a cell's result depends on its
+/// coordinates, never on which volume asked, so slices return identical
+/// values for the step-1 volumes generation uses (`find_top_surface` is the
+/// one volume-coupled sampler and never reaches the fill/graph roots this
+/// is for). `slice_y` of 0 or >= the volume's y size is the plain call.
+pub fn sample_volume_sliced(
+    sampler: &dyn DensitySampler,
+    context: &mut SamplerContext,
+    out: &mut [f32],
+    volume: DensityVolume,
+    slice_y: usize,
+) -> Result<(), SampleError> {
+    check_buffer(out, volume)?;
+    let [sx, sy, sz] = volume.sizes();
+    if slice_y == 0 || sy <= slice_y {
+        return sampler.sample_volume(context, out, volume);
+    }
+    let [bx, by, bz] = volume.minimum();
+    // The `(x + z*sx)*sy + y` layout holds a slice's columns as runs inside
+    // `out`; the slice buffer itself stays contiguous for the sampler.
+    let mut buf = Vec::new();
+    let mut oy = 0usize;
+    while oy < sy {
+        let h = slice_y.min(sy - oy);
+        let sub = DensityVolume::new(
+            [sx as i32, h as i32, sz as i32],
+            [bx, by.wrapping_add(oy as i32), bz],
+            volume.steps(),
+        )?;
+        buf.resize(sub.size(), 0.0);
+        sampler.sample_volume(context, &mut buf, sub)?;
+        for z in 0..sz {
+            for x in 0..sx {
+                let src = (x + z * sx) * h;
+                let dst = (x + z * sx) * sy + oy;
+                out[dst..dst + h].copy_from_slice(&buf[src..src + h]);
+            }
+        }
+        oy += h;
+    }
+    Ok(())
+}
 fn visit(
     volume: DensityVolume,
     mut cell: impl FnMut(usize, [i32; 3]) -> Result<(), SampleError>,

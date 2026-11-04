@@ -768,6 +768,11 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
     }
 }
 
+/// Vertical span of one `final_density` evaluation inside `fill_noise` —
+/// see `horizon_core::density::sample_volume_sliced` for why slices are
+/// exact and what they save.
+const FILL_SLICE_Y: usize = horizon_core::density::DEFAULT_SLICE_Y;
+
 /// Evaluate final density in bulk before writes, then visit Z/X/descending Y.
 /// The aquifer and final density must share this already prepared sampler context.
 /// Failures retain earlier writes and aquifer/cache state; there is no rollback.
@@ -822,7 +827,13 @@ fn fill_noise_inner<B: TerrainBlockStates>(
     }
     chunk.ensure_heightmap(HeightmapType::OceanFloorWg);
     chunk.ensure_heightmap(HeightmapType::WorldSurfaceWg);
-    final_density.sample_volume(context, density, volume)?;
+    horizon_core::density::sample_volume_sliced(
+        final_density,
+        context,
+        density,
+        volume,
+        FILL_SLICE_Y,
+    )?;
     let air_above = aquifer.air_above_y();
     // A non-air, non-fluid default block may be written as a run without asking
     // the aquifer or touching the heightmap below the run's top.

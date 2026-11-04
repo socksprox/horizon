@@ -116,7 +116,16 @@ impl<S: MaterialSurfaceQueries> MaterialSurfaceQueries for MaterialDensitySource
             (true, Some(buffer)) => Some(buffer),
             (true, None) => {
                 let mut buffer = vec![0.0; self.expected.size()];
-                sampler.sample_volume(&mut self.context, &mut buffer, self.expected)?;
+                // Sliced like the terrain fill: `self.context` is the
+                // worker's shared one — a full-volume eval would leave
+                // volume-sized buffers pooled in its scratch.
+                horizon_core::density::sample_volume_sliced(
+                    sampler.as_ref(),
+                    &mut self.context,
+                    &mut buffer,
+                    self.expected,
+                    horizon_core::density::DEFAULT_SLICE_Y,
+                )?;
                 self.retained_samples += buffer.len();
                 self.buffers.push(buffer);
                 Some(self.buffers.len() - 1)
