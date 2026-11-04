@@ -69,9 +69,20 @@ impl TerrainKernel {
     /// A kernel `size` blocks across whose weights fall off as
     /// e^(-d²/`distance`). Size 0 is the libraries' NONE: no density.
     pub fn new(size: i32, distance: i32, top: i32, bottom: i32) -> Self {
+        Self::try_new(size, distance, top, bottom).expect("kernel weights allocation")
+    }
+    /// `new` with fallible growth — `size³` f32 weights are reserved through
+    /// `try_reserve`, so `None` means the kernel never began (the mark in
+    /// [`crate::alloc`] is already noted for `try_` entry points).
+    pub fn try_new(size: i32, distance: i32, top: i32, bottom: i32) -> Option<Self> {
         let size = size.max(0);
         let radius = size / 2;
-        let mut weights = vec![0.; (size as usize).pow(3)];
+        let mut weights = Vec::new();
+        if weights.try_reserve_exact((size as usize).pow(3)).is_err() {
+            crate::alloc::note();
+            return None;
+        }
+        weights.resize((size as usize).pow(3), 0.);
         for x in 0..size {
             for y in 0..size {
                 for z in 0..size {
@@ -87,12 +98,12 @@ impl TerrainKernel {
                 }
             }
         }
-        Self {
+        Some(Self {
             size,
             top,
             bottom,
             weights,
-        }
+        })
     }
     pub fn radius(&self) -> i32 {
         self.size / 2

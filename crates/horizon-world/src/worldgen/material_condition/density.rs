@@ -2,7 +2,7 @@
 use super::{MaterialRuleError, MaterialSurfaceQueries};
 use crate::{registry::BlockStateId, worldgen::DecodeError};
 use horizon_core::{
-    density::{DensitySampler, SamplerContext},
+    density::{DensitySampler, SampleError, SamplerContext},
     noise::{DensityVolume, Noise},
     position::BlockPos,
 };
@@ -56,6 +56,12 @@ impl<S: MaterialSurfaceQueries> MaterialDensitySources<S> {
         }
         for (sampler, buffer) in pending {
             let out = &mut self.buffers[buffer];
+            if out.capacity() < volume.size()
+                && out.try_reserve(volume.size() - out.len()).is_err()
+            {
+                horizon_core::alloc::note();
+                return Err(DecodeError::Sample(SampleError::Alloc));
+            }
             out.resize(volume.size(), 0.0);
             sampler.sample_volume(&mut self.context, out, volume)?;
         }
@@ -115,7 +121,12 @@ impl<S: MaterialSurfaceQueries> MaterialSurfaceQueries for MaterialDensitySource
             // so a second binding (iron and copper veins' richness) reuses it.
             (true, Some(buffer)) => Some(buffer),
             (true, None) => {
-                let mut buffer = vec![0.0; self.expected.size()];
+                let mut buffer = Vec::new();
+                if buffer.try_reserve_exact(self.expected.size()).is_err() {
+                    horizon_core::alloc::note();
+                    return Err(DecodeError::Sample(SampleError::Alloc));
+                }
+                buffer.resize(self.expected.size(), 0.0);
                 // Sliced like the terrain fill: `self.context` is the
                 // worker's shared one — a full-volume eval would leave
                 // volume-sized buffers pooled in its scratch.
@@ -152,8 +163,14 @@ impl<S: MaterialSurfaceQueries> MaterialSurfaceQueries for MaterialDensitySource
         let position = [position.x, 0, position.z];
         if let Some(index) = self.plane.index_of_block(position) {
             if self.buffer.is_none() {
+                let mut buffer = Vec::new();
+                if buffer.try_reserve_exact(self.plane.size()).is_err() {
+                    horizon_core::alloc::note();
+                    return Err(MaterialRuleError::Density(SampleError::Alloc));
+                }
+                buffer.resize(self.plane.size(), 0.0);
                 // Retain the allocation and partial writes if sampling fails.
-                let buffer = self.buffer.insert(vec![0.0; self.plane.size()]);
+                let buffer = self.buffer.insert(buffer);
                 self.sampler
                     .sample_volume(&mut self.context, buffer, self.plane)?;
             }

@@ -18,6 +18,9 @@ pub enum CarvingMaskError {
     InvalidBounds,
     NegativeIndex,
     Capacity,
+    /// A `try_reserve` failed. `try_` entry points read the mark in
+    /// [`crate::alloc`]; everywhere else it is an ordinary error.
+    Alloc,
 }
 impl std::fmt::Display for CarvingMaskError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -25,6 +28,7 @@ impl std::fmt::Display for CarvingMaskError {
             Self::InvalidBounds => "carving mask height must be between 1 and 4064",
             Self::NegativeIndex => "carving mask index is negative",
             Self::Capacity => "carving mask exceeds its bounded bit capacity",
+            Self::Alloc => "carving mask allocation failed",
         })
     }
 }
@@ -47,11 +51,19 @@ impl CarvingMask {
         if !(1..=4064).contains(&height) {
             return Err(CarvingMaskError::InvalidBounds);
         }
+        let mut words = Vec::new();
+        words
+            .try_reserve_exact((height as usize * 256).div_ceil(64))
+            .map_err(|_| {
+                crate::alloc::note();
+                CarvingMaskError::Alloc
+            })?;
+        words.resize((height as usize * 256).div_ceil(64), 0);
         Ok(Self {
             min_y,
             max_y,
             height: height as i32,
-            words: vec![0; (height as usize * 256).div_ceil(64)],
+            words,
             used_words: 0,
         })
     }
@@ -77,6 +89,10 @@ impl CarvingMask {
         let index = index as usize;
         let word = index / 64;
         if word >= self.words.len() {
+            self.words.try_reserve(word + 1 - self.words.len()).map_err(|_| {
+                crate::alloc::note();
+                CarvingMaskError::Alloc
+            })?;
             self.words.resize(word + 1, 0);
         }
         self.words[word] |= 1 << (index & 63);

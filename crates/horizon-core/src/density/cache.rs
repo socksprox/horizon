@@ -54,7 +54,12 @@ impl SamplerContext {
             return Ok(false);
         };
         if id >= caches.len() {
-            caches.resize_with((id + 16) & !15, CacheCell::default);
+            let want = (id + 16) & !15;
+            if caches.try_reserve(want - caches.len()).is_err() {
+                crate::alloc::note();
+                return Err(SampleError::Alloc);
+            }
+            caches.resize_with(want, CacheCell::default);
         }
         if caches[id].active {
             return Err(SampleError::RecursiveCache);
@@ -127,6 +132,14 @@ impl DensitySampler for CachingDensitySampler {
             return Ok(());
         }
         let mut cached = std::mem::take(&mut cell.buffer);
+        if cached.capacity() < volume.size()
+            && cached.try_reserve(volume.size() - cached.len()).is_err()
+        {
+            crate::alloc::note();
+            let cell = &mut context.caches.as_mut().unwrap()[self.id];
+            cell.buffer = cached;
+            return Err(SampleError::Alloc);
+        }
         cached.resize(volume.size(), 0.0);
         // Unwritten values after a failed child are deterministic. Differential
         // error tests use a reference arena with the same zero-initialization.

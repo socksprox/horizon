@@ -57,6 +57,9 @@ pub enum SampleError {
     RecursiveCache,
     SurfaceRequiresSingleLayer,
     SurfaceSearchOverflow,
+    /// A `try_reserve` failed. `try_` entry points read the mark in
+    /// [`crate::alloc`]; everywhere else it is an ordinary error.
+    Alloc,
 }
 impl From<DensityError> for SampleError {
     fn from(value: DensityError) -> Self {
@@ -73,6 +76,7 @@ impl std::fmt::Display for SampleError {
             Self::SurfaceSearchOverflow => {
                 f.write_str("surface search crossed the integer height domain")
             }
+            Self::Alloc => f.write_str("density sample allocation failed"),
             Self::CacheIdOutOfRange => f.write_str("density cache id exceeds 65535"),
             Self::RecursiveCache => f.write_str("density cache reentered its own evaluation"),
             Self::ExactBufferSizeRequired => {
@@ -104,6 +108,13 @@ impl SamplerContext {
         sample: impl FnOnce(&mut Self, &mut [f32]) -> Result<T, SampleError>,
     ) -> Result<T, SampleError> {
         let mut buffer = self.scratch.pop().unwrap_or_default();
+        if buffer.capacity() < size
+            && buffer.try_reserve(size - buffer.len()).is_err()
+        {
+            crate::alloc::note();
+            self.scratch.push(buffer);
+            return Err(SampleError::Alloc);
+        }
         buffer.resize(size, 0.0);
         let result = sample(self, &mut buffer);
         self.scratch.push(buffer);
@@ -214,6 +225,12 @@ pub fn sample_volume_sliced(
             [bx, by.wrapping_add(oy as i32), bz],
             volume.steps(),
         )?;
+        if buf.capacity() < sub.size()
+            && buf.try_reserve(sub.size() - buf.len()).is_err()
+        {
+            crate::alloc::note();
+            return Err(SampleError::Alloc);
+        }
         buf.resize(sub.size(), 0.0);
         sampler.sample_volume(context, &mut buf, sub)?;
         for z in 0..sz {

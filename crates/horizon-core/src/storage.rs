@@ -47,6 +47,9 @@ pub enum StorageError {
     InvalidLength { expected: usize, actual: usize },
     OutOfBounds { index: usize, len: usize },
     ValueTooLarge(u32),
+    /// The word array's `try_reserve` failed. `try_` entry points read the
+    /// mark in [`crate::alloc`]; everywhere else it is an ordinary error.
+    Alloc,
 }
 
 impl std::fmt::Display for StorageError {
@@ -76,7 +79,15 @@ impl PackedStorage {
     }
     pub fn new(bits: u8, len: usize) -> Result<Self, StorageError> {
         let per_word = Self::per_word(bits)?;
-        Self::from_words(bits, len, vec![0; len.div_ceil(per_word)])
+        let mut words = Vec::new();
+        words
+            .try_reserve_exact(len.div_ceil(per_word))
+            .map_err(|_| {
+                crate::alloc::note();
+                StorageError::Alloc
+            })?;
+        words.resize(len.div_ceil(per_word), 0);
+        Self::from_words(bits, len, words)
     }
 
     /// Retains padding and unused tail bits from input, as the Java long[] does.

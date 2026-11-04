@@ -47,6 +47,9 @@ pub enum SurfaceError {
     InvalidBounds,
     InvalidVolume,
     IterationLimit,
+    /// A `try_reserve` failed. `try_` entry points read the mark in
+    /// [`horizon_core::alloc`]; everywhere else it is an ordinary error.
+    Alloc,
 }
 impl std::fmt::Display for SurfaceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -131,7 +134,7 @@ impl<'a, 'r, B: TerrainBlockStates> Column<'a, 'r, B> {
         max: i32,
         top: i32,
         cache: &'a mut ColumnCache,
-    ) -> Self {
+    ) -> Result<Self, SurfaceError> {
         let chunk_min = chunk.min_y();
         let chunk_max = chunk_min.wrapping_add(chunk.height()).wrapping_sub(1);
         let high = top.min(chunk_max);
@@ -140,8 +143,13 @@ impl<'a, 'r, B: TerrainBlockStates> Column<'a, 'r, B> {
         cache.kinds.clear();
         if high >= low {
             let count = (high - low + 1) as usize;
-            cache.states.reserve(count);
-            cache.kinds.reserve(count);
+            // `try_generate_proto`'s fallible seam: the walk's only growth.
+            let alloc = |_| {
+                horizon_core::alloc::note();
+                SurfaceError::Alloc
+            };
+            cache.states.try_reserve(count).map_err(alloc)?;
+            cache.kinds.try_reserve(count).map_err(alloc)?;
             // An all-air or one-state section part comes as one run, and runs
             // of one state share a kind lookup.
             let blocks: &TerrainChunk<'r, B> = chunk;
@@ -160,7 +168,7 @@ impl<'a, 'r, B: TerrainBlockStates> Column<'a, 'r, B> {
             });
         }
         let bounds = chunk.worldgen_column_bounds(x, z);
-        Self {
+        Ok(Self {
             chunk,
             x,
             z,
@@ -170,7 +178,7 @@ impl<'a, 'r, B: TerrainBlockStates> Column<'a, 'r, B> {
             low,
             high,
             bounds,
-        }
+        })
     }
     fn cache_index(&self, y: i32) -> Option<usize> {
         (y >= self.low && y <= self.high).then(|| (y - self.low) as usize)
@@ -203,7 +211,7 @@ impl<B: TerrainBlockStates> MaterialColumn for Column<'_, '_, B> {
                 }
             }
             if properties.has_fluid() {
-                self.chunk.mark_postprocessing(self.x, y, self.z);
+                self.chunk.try_mark_postprocessing(self.x, y, self.z)?;
             }
         }
         Ok(())
@@ -420,7 +428,7 @@ where
                         write_max_y,
                         original_top,
                         &mut cache,
-                    ),
+                    )?,
                     x,
                     z,
                     original_top,
@@ -449,7 +457,8 @@ where
             let mut band_low = variants.band_bounds(band)[0];
             // The column's minimum surface level, read once when first needed.
             let mut minimum = None;
-            let mut column = Column::new(chunk, x, z, write_min_y, write_max_y, top, &mut cache);
+            let mut column =
+                Column::new(chunk, x, z, write_min_y, write_max_y, top, &mut cache)?;
             while y >= min {
                 tick(&mut budget)?;
                 match column.kind(y) {

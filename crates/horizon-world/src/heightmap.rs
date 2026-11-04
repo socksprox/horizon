@@ -81,6 +81,9 @@ pub enum HeightmapError {
     InvalidBounds,
     MismatchedChunk,
     Storage(StorageError),
+    /// A `try_reserve` failed. `try_` entry points read the mark in
+    /// [`horizon_core::alloc`]; everywhere else it is an ordinary error.
+    Alloc,
 }
 impl From<StorageError> for HeightmapError {
     fn from(value: StorageError) -> Self {
@@ -248,7 +251,11 @@ impl Heightmap {
             map.check_chunk(chunk)?;
         }
         let upper = chunk.highest_section_y().wrapping_add(16);
-        let mut remaining = Vec::with_capacity(maps.len());
+        let mut remaining = Vec::new();
+        remaining.try_reserve(maps.len()).map_err(|_| {
+            horizon_core::alloc::note();
+            HeightmapError::Alloc
+        })?;
         for x in 0..16 {
             for z in 0..16 {
                 remaining.clear();

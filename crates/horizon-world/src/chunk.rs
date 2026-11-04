@@ -369,6 +369,20 @@ fn id_in(
 fn out_of_bounds() -> io::Error {
     invalid("section index out of bounds")
 }
+/// A `try_reserve` failure as the section's io error — the
+/// [`horizon_core::alloc`] mark carries the `try_`-path signal.
+#[cold]
+fn oom() -> io::Error {
+    horizon_core::alloc::note();
+    io::Error::from(io::ErrorKind::OutOfMemory)
+}
+/// One-element `vec![v]` with fallible growth.
+fn one<T: Clone>(v: T) -> io::Result<Vec<T>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(1).map_err(|_| oom())?;
+    out.push(v);
+    Ok(out)
+}
 pub struct BlockSection<'r> {
     palette: Vec<BlockStateId>,
     last: Option<(BlockStateId, u32)>,
@@ -401,9 +415,9 @@ impl<'r> BlockSection<'r> {
             return Err(invalid("state ID outside registry"));
         }
         Ok(Self {
-            palette: vec![state],
+            palette: one(state)?,
             last: Some((state, 0)),
-            counts: vec![4096],
+            counts: one(4096)?,
             free: Vec::new(),
             storage: None,
             registry,
@@ -523,6 +537,8 @@ impl<'r> BlockSection<'r> {
                         }
                         self.storage = Some(storage);
                     }
+                    self.palette.try_reserve(1).map_err(|_| oom())?;
+                    self.counts.try_reserve(1).map_err(|_| oom())?;
                     self.palette.push(state);
                     self.counts.push(0);
                     self.last = Some((state, id));
@@ -534,15 +550,16 @@ impl<'r> BlockSection<'r> {
         self.counts[old_id as usize] -= 1;
         self.counts[id as usize] += 1;
         if self.counts[old_id as usize] == 0 {
+            self.free.try_reserve(1).map_err(|_| oom())?;
             self.free.push(old_id);
             if self.last == Some((old, old_id)) {
                 self.last = None;
             }
         }
         if self.counts[id as usize] == 4096 {
-            self.palette = vec![state];
+            self.palette = one(state)?;
             self.last = Some((state, 0));
-            self.counts = vec![4096];
+            self.counts = one(4096)?;
             self.free.clear();
             self.storage = None;
         }
@@ -599,6 +616,7 @@ impl<'r> BlockSection<'r> {
                 added += 1;
             }
             if self.counts[old_id as usize] == 0 {
+                self.free.try_reserve(1).map_err(|_| oom())?;
                 self.free.push(old_id);
                 if self.last == Some((old_state, old_id)) {
                     self.last = None;
@@ -606,16 +624,18 @@ impl<'r> BlockSection<'r> {
             }
         }
         if self.counts[id as usize] == 4096 {
-            self.palette = vec![state];
+            self.palette = one(state)?;
             self.last = Some((state, 0));
-            self.counts = vec![4096];
+            self.counts = one(4096)?;
             self.free.clear();
             self.storage = None;
         }
         Ok(added)
     }
     pub fn compact(&mut self) -> io::Result<()> {
-        let values: Vec<_> = (0..4096).map(|i| self.get(i).unwrap()).collect();
+        let mut values = Vec::new();
+        values.try_reserve_exact(4096).map_err(|_| oom())?;
+        values.extend((0..4096).map(|i| self.get(i).unwrap()));
         self.palette.clear();
         self.last = None;
         self.counts.clear();
@@ -624,6 +644,8 @@ impl<'r> BlockSection<'r> {
             if let Some(id) = id_in(&self.palette, &self.counts, &mut self.last, *state) {
                 self.counts[id as usize] += 1;
             } else {
+                self.palette.try_reserve(1).map_err(|_| oom())?;
+                self.counts.try_reserve(1).map_err(|_| oom())?;
                 self.palette.push(*state);
                 self.counts.push(1);
                 self.last = Some((*state, self.palette.len() as u32 - 1));

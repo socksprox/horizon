@@ -98,6 +98,9 @@ pub enum TerrainError {
     InvalidState,
     InvalidVolume,
     OutsideBuildHeight,
+    /// A `try_reserve` failed. `try_` entry points read the mark in
+    /// [`horizon_core::alloc`]; everywhere else it is an ordinary error.
+    Alloc,
 }
 impl std::fmt::Display for TerrainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -307,9 +310,25 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
             .default_state("minecraft:void_air")
             .ok_or(TerrainError::MissingAir)?;
         let section_count = (height / 16) as usize;
-        let sections = (0..section_count)
-            .map(|_| BlockSection::uniform(air, registry))
-            .collect::<io::Result<Vec<_>>>()?;
+        let alloc = || {
+            horizon_core::alloc::note();
+            TerrainError::Alloc
+        };
+        let mut sections = Vec::new();
+        sections.try_reserve(section_count).map_err(|_| alloc())?;
+        for _ in 0..section_count {
+            sections.push(BlockSection::uniform(air, registry)?);
+        }
+        let mut non_air = Vec::new();
+        non_air.try_reserve(section_count).map_err(|_| alloc())?;
+        non_air.resize(section_count, 0);
+        let mut postprocessing = Vec::new();
+        postprocessing
+            .try_reserve(section_count)
+            .map_err(|_| alloc())?;
+        for _ in 0..section_count {
+            postprocessing.push(Vec::new());
+        }
         Ok(Self {
             stage: PreLightChunkStage::Empty,
             below_zero_retrogen: None,
@@ -318,14 +337,14 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
                 min_y,
                 height,
                 sections,
-                non_air: vec![0; section_count],
+                non_air,
                 registry,
                 properties,
                 air,
                 void_air,
             },
             heightmaps: std::array::from_fn(|_| None),
-            postprocessing: vec![Vec::new(); section_count],
+            postprocessing,
             block_ticks: ProtoChunkTicks::default(),
             fluid_ticks: ProtoChunkTicks::default(),
         })
@@ -412,6 +431,12 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
         }
         let previous = self.set_block_raw(x, y, z, state)?;
         let mut missing = Vec::new();
+        missing
+            .try_reserve(self.stage.heightmaps().len())
+            .map_err(|_| {
+                horizon_core::alloc::note();
+                TerrainError::Alloc
+            })?;
         for &kind in self.stage.heightmaps() {
             match self.heightmap(kind) {
                 // `Heightmap::update` would return at once: no state is read.
@@ -645,10 +670,23 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
     }
 
     pub fn ensure_heightmap(&mut self, kind: HeightmapType) -> &mut Heightmap {
-        self.heightmaps[kind as usize].get_or_insert_with(|| {
-            Heightmap::new(kind, self.blocks.min_y, self.blocks.height)
-                .expect("validated chunk range")
-        })
+        self.try_ensure_heightmap(kind)
+            .expect("validated chunk range")
+    }
+    /// `ensure_heightmap` with fallible growth — a failed `Heightmap`
+    /// allocation returns `Err` (the [`horizon_core::alloc`] mark is
+    /// already noted) instead of aborting on `vec!`.
+    pub fn try_ensure_heightmap(
+        &mut self,
+        kind: HeightmapType,
+    ) -> Result<&mut Heightmap, TerrainError> {
+        if self.heightmaps[kind as usize].is_none() {
+            self.heightmaps[kind as usize] = Some(
+                Heightmap::new(kind, self.blocks.min_y, self.blocks.height)
+                    .map_err(TerrainError::from)?,
+            );
+        }
+        Ok(self.heightmaps[kind as usize].as_mut().unwrap())
     }
     /// Section write only. The caller chooses which generation-stage maps to update.
     pub fn set_block_raw(
@@ -721,7 +759,7 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
         if self.blocks.registry.state(state).is_none() {
             return Err(TerrainError::InvalidState);
         }
-        self.ensure_heightmap(kind);
+        self.try_ensure_heightmap(kind)?;
         let state = self.blocks.properties.heightmap_state(state);
         Ok(self.heightmaps[kind as usize]
             .as_mut()
@@ -729,30 +767,34 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
             .update(&self.blocks, x, y, z, state)?)
     }
     pub fn prime_heightmaps(&mut self, kinds: &[HeightmapType]) -> Result<(), TerrainError> {
+        let alloc = || {
+            horizon_core::alloc::note();
+            TerrainError::Alloc
+        };
         let mut order = Vec::new();
+        order.try_reserve(kinds.len()).map_err(|_| alloc())?;
         for &kind in kinds {
-            self.ensure_heightmap(kind);
+            self.try_ensure_heightmap(kind)?;
             if !order.contains(&(kind as usize)) {
                 order.push(kind as usize);
             }
         }
         // Split references preserve the supplied set's iteration order.
-        let mut maps: Vec<_> = self
-            .heightmaps
-            .iter_mut()
-            .enumerate()
-            .filter_map(|(i, map)| {
+        let mut maps: Vec<_> = Vec::new();
+        maps.try_reserve(order.len()).map_err(|_| alloc())?;
+        maps.extend(self.heightmaps.iter_mut().enumerate().filter_map(
+            |(i, map)| {
                 order
                     .iter()
                     .position(|&key| key == i)
                     .map(|position| (position, map.as_mut().unwrap()))
-            })
-            .collect();
+            },
+        ));
         maps.sort_by_key(|(position, _)| *position);
-        Heightmap::prime(
-            &self.blocks,
-            &mut maps.into_iter().map(|(_, map)| map).collect::<Vec<_>>(),
-        )?;
+        let mut refs: Vec<&mut Heightmap> = Vec::new();
+        refs.try_reserve(maps.len()).map_err(|_| alloc())?;
+        refs.extend(maps.into_iter().map(|(_, map)| map));
+        Heightmap::prime(&self.blocks, &mut refs)?;
         Ok(())
     }
     /// Before replaying a saved chunk's `PostProcessing` lists.
@@ -761,10 +803,28 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
     }
     /// Preserves duplicates and insertion order, as ProtoChunk does.
     pub fn mark_postprocessing(&mut self, x: i32, y: i32, z: i32) {
+        self.try_mark_postprocessing(x, y, z)
+            .expect("postprocessing list allocation")
+    }
+    /// `mark_postprocessing` with fallible growth — a failed list push
+    /// returns `Err` (the [`horizon_core::alloc`] mark is already noted).
+    pub fn try_mark_postprocessing(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+    ) -> Result<(), TerrainError> {
         if let Some(section) = self.blocks.section_index(y) {
+            self.postprocessing[section]
+                .try_reserve(1)
+                .map_err(|_| {
+                    horizon_core::alloc::note();
+                    TerrainError::Alloc
+                })?;
             self.postprocessing[section]
                 .push(((x & 15) | ((y & 15) << 4) | ((z & 15) << 8)) as u16);
         }
+        Ok(())
     }
 }
 
@@ -788,6 +848,12 @@ pub fn fill_noise<B: TerrainBlockStates>(
     let size = volume.size();
     SCRATCH_DENSITY.with_borrow_mut(|scratch| {
         if scratch.len() < size {
+            if scratch.capacity() < size
+                && scratch.try_reserve(size - scratch.len()).is_err()
+            {
+                horizon_core::alloc::note();
+                return Err(TerrainError::Alloc);
+            }
             scratch.resize(size, 0.0);
         }
         scratch[..size].fill(0.0);
@@ -825,8 +891,8 @@ fn fill_noise_inner<B: TerrainBlockStates>(
     {
         return Err(TerrainError::InvalidVolume);
     }
-    chunk.ensure_heightmap(HeightmapType::OceanFloorWg);
-    chunk.ensure_heightmap(HeightmapType::WorldSurfaceWg);
+    chunk.try_ensure_heightmap(HeightmapType::OceanFloorWg)?;
+    chunk.try_ensure_heightmap(HeightmapType::WorldSurfaceWg)?;
     horizon_core::density::sample_volume_sliced(
         final_density,
         context,

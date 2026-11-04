@@ -41,13 +41,21 @@ impl<T: Clone> BiomeChunk<T> {
         default: T,
     ) -> Result<Self, HeightmapError> {
         Heightmap::new(HeightmapType::WorldSurfaceWg, min_y, height)?;
+        let mut sections = Vec::new();
+        sections
+            .try_reserve_exact((height / 16) as usize)
+            .map_err(|_| {
+                horizon_core::alloc::note();
+                HeightmapError::Alloc
+            })?;
+        for _ in 0..height / 16 {
+            sections.push(std::array::from_fn(|_| default.clone()));
+        }
         Ok(Self {
             position,
             min_y,
             height,
-            sections: (0..height / 16)
-                .map(|_| std::array::from_fn(|_| default.clone()))
-                .collect(),
+            sections,
         })
     }
     pub fn section(&self, index: usize) -> Option<&[T; 64]> {

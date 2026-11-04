@@ -87,7 +87,14 @@ impl ClimateSampler {
         extents: [i32; 3],
     ) -> Result<ClimateVolume, SampleError> {
         let volume = DensityVolume::new(extents, quart_minimum.map(|v| v.wrapping_shl(2)), [4; 3])?;
-        let mut fields = std::array::from_fn(|_| vec![0.; volume.size()]);
+        let mut fields: [Vec<f32>; 6] = std::array::from_fn(|_| Vec::new());
+        for field in &mut fields {
+            if field.try_reserve_exact(volume.size()).is_err() {
+                horizon_core::alloc::note();
+                return Err(SampleError::Alloc);
+            }
+            field.resize(volume.size(), 0.);
+        }
         for (sampler, field) in self.samplers.iter().zip(&mut fields) {
             sampler.sample_volume(context, field, volume)?;
         }

@@ -192,15 +192,15 @@ impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> NoiseBasedAquif
             })
             .filter(|n| *n <= 16_777_216)
             .ok_or(AquiferError::InvalidGrid)?;
+        let alloc = || {
+            horizon_core::alloc::note();
+            AquiferError::Allocation
+        };
         let mut statuses = Vec::new();
-        statuses
-            .try_reserve_exact(count)
-            .map_err(|_| AquiferError::Allocation)?;
+        statuses.try_reserve_exact(count).map_err(|_| alloc())?;
         statuses.resize(count, None);
         let mut locations = Vec::new();
-        locations
-            .try_reserve_exact(count)
-            .map_err(|_| AquiferError::Allocation)?;
+        locations.try_reserve_exact(count).map_err(|_| alloc())?;
         locations.resize(count, i64::MAX);
         let mut points = Vec::new();
         points
@@ -300,6 +300,12 @@ impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> NoiseBasedAquif
         let level = self
             .sample(AquiferField::SurfaceLevel, context, [x, 0, z])?
             .floor() as i32;
+        self.surfaces
+            .try_reserve(1)
+            .map_err(|_| {
+                horizon_core::alloc::note();
+                AquiferError::Allocation
+            })?;
         self.surfaces.insert(key, level);
         Ok(level)
     }
@@ -323,14 +329,20 @@ impl<P: FluidPicker, F: PositionalRandom, B: AquiferBlockStates> NoiseBasedAquif
         let mut buffer = Vec::new();
         buffer
             .try_reserve_exact(volume.size())
-            .map_err(|_| AquiferError::Allocation)?;
+            .map_err(|_| {
+                horizon_core::alloc::note();
+                AquiferError::Allocation
+            })?;
         buffer.resize(volume.size(), 0.);
         self.samplers
             .get(AquiferField::SurfaceLevel)
             .sample_volume(context, &mut buffer, volume)?;
         self.surfaces
             .try_reserve(volume.size())
-            .map_err(|_| AquiferError::Allocation)?;
+            .map_err(|_| {
+                horizon_core::alloc::note();
+                AquiferError::Allocation
+            })?;
         let mut maximum = i32::MIN;
         let mut index = 0;
         for z in 0..sizes[1] {

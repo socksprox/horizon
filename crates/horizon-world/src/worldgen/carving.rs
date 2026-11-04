@@ -144,7 +144,7 @@ where
             };
             chunk.set_block_worldgen(x, y, z, state)?;
             if aquifer.should_schedule_fluid_update() && chunk.block_properties(state).has_fluid() {
-                chunk.mark_postprocessing(x, y, z);
+                chunk.try_mark_postprocessing(x, y, z)?;
             }
             let below = y.wrapping_sub(1);
             if found_surface && blocks.flags(chunk.block(x, below, z))? & 4 != 0 {
@@ -160,7 +160,7 @@ where
                 if let Some(replacement) = replacement {
                     chunk.set_block_worldgen(x, below, z, replacement)?;
                     if chunk.block_properties(replacement).has_fluid() {
-                        chunk.mark_postprocessing(x, below, z);
+                        chunk.try_mark_postprocessing(x, below, z)?;
                     }
                 }
             }

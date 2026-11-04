@@ -66,6 +66,9 @@ pub enum GeneratorError {
     Resource(String),
     /// A generation stage failed; the chunk is incomplete.
     Stage(&'static str, String),
+    /// A `try_reserve` failed. `try_generate` reports it through the mark
+    /// in [`horizon_core::alloc`]; everywhere else it is an ordinary error.
+    Alloc,
 }
 impl std::fmt::Display for GeneratorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -74,6 +77,7 @@ impl std::fmt::Display for GeneratorError {
             Self::Decode(e) => e.fmt(f),
             Self::Resource(e) => write!(f, "invalid generator resources: {e}"),
             Self::Stage(stage, e) => write!(f, "{stage} failed: {e}"),
+            Self::Alloc => f.write_str("generation allocation failed"),
         }
     }
 }
@@ -2073,7 +2077,11 @@ where
             self.settings.sea_level,
         );
         let mut clock = std::time::Instant::now();
-        let mut neighbors = Vec::with_capacity(9);
+        let mut neighbors = Vec::new();
+        neighbors.try_reserve(9).map_err(|_| {
+            horizon_core::alloc::note();
+            GeneratorError::Alloc
+        })?;
         // The biome ids present, as a bitset: ascending like a sorted set.
         let mut seen: Vec<u64> = Vec::new();
         // Build the neighbours no other thread is building first, then wait
@@ -2100,6 +2108,10 @@ where
                         last = Some(id);
                         let word = id.0 as usize / 64;
                         if seen.len() <= word {
+                            seen.try_reserve(word + 1 - seen.len()).map_err(|_| {
+                                horizon_core::alloc::note();
+                                GeneratorError::Alloc
+                            })?;
                             seen.resize(word + 1, 0);
                         }
                         seen[word] |= 1 << (id.0 % 64);
@@ -2281,11 +2293,16 @@ where
                         pipeline: self,
                         temperatures: &mut worker.temperatures,
                         biome: Biomes::Region(&biomes),
-                        uniform_biomes: Some(UniformSurfaceBiomes::new(
+                        uniform_biomes: UniformSurfaceBiomes::try_new(
                             pos,
                             self.settings.level_min_y,
                             self.settings.level_height,
-                        )),
+                        )
+                        .ok_or_else(|| {
+                            horizon_core::alloc::note();
+                            GeneratorError::Alloc
+                        })?
+                        .into(),
                         possible: Some(possible),
                     },
                     preliminary_surface: self.preliminary.clone(),
@@ -2738,19 +2755,30 @@ struct UniformSurfaceBiomes {
     last: ([i32; 3], SurfaceCell),
 }
 impl UniformSurfaceBiomes {
+    #[cfg(test)]
     fn new(pos: ChunkPos, min_y: i32, height: i32) -> Self {
+        Self::try_new(pos, min_y, height).expect("biome cell slab")
+    }
+    /// `None` when the cell slab's `try_reserve` fails — the
+    /// [`horizon_core::alloc`] mark is noted by the caller-facing wrapper.
+    fn try_new(pos: ChunkPos, min_y: i32, height: i32) -> Option<Self> {
         let height = (height >> 2) + 1;
-        Self {
+        let mut cells = Vec::new();
+        cells
+            .try_reserve_exact(25 * height as usize)
+            .ok()?;
+        cells.resize(25 * height as usize, SurfaceCell::Unknown);
+        Some(Self {
             origin: [
                 pos.x.wrapping_shl(4).wrapping_sub(2) >> 2,
                 min_y.wrapping_sub(2) >> 2,
                 pos.z.wrapping_shl(4).wrapping_sub(2) >> 2,
             ],
             height,
-            cells: vec![SurfaceCell::Unknown; 25 * height as usize],
+            cells,
             mixed: Vec::new(),
             last: ([0; 3], SurfaceCell::Unknown),
-        }
+        })
     }
     #[inline]
     fn get(&mut self, region: &BiomeRegion<BiomeId>, p: BlockPos) -> Option<BiomeId> {
@@ -4325,6 +4353,24 @@ impl GeneratorWorker {
         let result = self.pipeline.generate(&mut self.state, pos);
         self.state.timings.chunks += 1;
         result
+    }
+    /// `generate_proto` with fallible growth: a `try_reserve` failure
+    /// anywhere in the pipeline is noted in [`horizon_core::alloc`] and
+    /// returned as the ordinary error of its stage; `Ok(None)` reports the
+    /// marked failure — the partial chunk is dropped and the caller can
+    /// skip or retry it instead of dying to `handle_alloc_error`.
+    pub fn try_generate_proto(
+        &mut self,
+        pos: ChunkPos,
+    ) -> Result<Option<ProtoChunk>, GeneratorError> {
+        horizon_core::alloc::clear();
+        let result = self.pipeline.generate(&mut self.state, pos);
+        let marked = horizon_core::alloc::take();
+        self.state.timings.chunks += 1;
+        if marked && result.is_err() {
+            return Ok(None);
+        }
+        result.map(Some)
     }
     /// Noise/aquifer surface and its material rule, without chunks, structures or features.
     pub fn surface_sample(&mut self, x: i32, z: i32) -> Option<SurfaceSample> {
