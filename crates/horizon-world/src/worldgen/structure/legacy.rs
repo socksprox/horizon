@@ -1227,6 +1227,8 @@ mod tests {
             std::path::Path::new("/nonexistent"),
             std::collections::BTreeMap::new(),
             &std::collections::BTreeMap::new(),
+            None,
+            std::collections::BTreeMap::new(),
         );
         let frame = PieceFrame {
             bounding_box: BoundingBox::new([0, 0, 0], [16, 16, 16]),

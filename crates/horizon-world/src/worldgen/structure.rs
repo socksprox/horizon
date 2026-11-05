@@ -20,11 +20,13 @@ pub mod start;
 pub mod start_checks;
 pub mod stronghold;
 pub mod template;
+pub mod template_meta;
 pub mod temple;
 
 use crate::{
     nbt::{self, Limits},
     registry::{BlockRegistry, BlockStateId},
+    worldgen::generator::PackedWorldgen,
 };
 use horizon_core::geometry::Direction;
 use processor::ProcessorList;
@@ -34,10 +36,11 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, RwLock,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicUsize, Ordering},
     },
 };
 pub use template::{BlockInfo, EntityInfo, JigsawInfo, StructureTemplate, save_nbt};
+pub use template_meta::TemplateMeta;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Rotation {
@@ -287,8 +290,55 @@ impl StateTransforms {
 /// second structure assembling alongside on another worker. A miss reloads
 /// through the same cold path the first touch used, so evicting an entry
 /// changes residency only, never what `template()` returns.
+/// Bound on the metas `template_meta` keeps: more than every template of
+/// the vanilla data (~1,500), so it never evicts in practice; a map past it
+/// starts over rather than growing.
+const META_LIMIT: usize = 2048;
 const TEMPLATE_CACHE_LIMIT: usize = 512;
 const TEMPLATE_CACHE_BYTES: usize = 24 * 1024 * 1024;
+/// The limits in force (entries, bytes) — [`set_template_cache_limits`]
+/// lowers them for a host with a small heap.
+static TEMPLATE_LIMITS: [AtomicUsize; 2] = [
+    AtomicUsize::new(TEMPLATE_CACHE_LIMIT),
+    AtomicUsize::new(TEMPLATE_CACHE_BYTES),
+];
+/// Bound the decoded-template cache at `entries` templates and `bytes` of
+/// decoded size (both process-wide, taking effect on the next insert). A
+/// pool element only keeps a template's id (`jigsaw::TemplateRef`), so this
+/// cache is the only residency a structure's templates have: a small bound
+/// reloads templates the assembly touches again, never changes a result.
+pub fn set_template_cache_limits(entries: usize, bytes: usize) {
+    TEMPLATE_LIMITS[0].store(entries.max(1), Ordering::Relaxed);
+    TEMPLATE_LIMITS[1].store(bytes, Ordering::Relaxed);
+}
+/// The chunk radius a start-cache shard keeps when it fills (0 = never
+/// prune, the default: a server's players can be far apart).
+static START_PRUNE_RADIUS: AtomicU32 = AtomicU32::new(0);
+/// Let a full start-cache shard drop the starts farther than `radius`
+/// chunks from the chunk being inserted, instead of growing to its 64k
+/// entries. A single-window host (one player; the window and a chunk's
+/// 8-chunk reference reach fit well inside) passes a radius past that; a
+/// start needed again is rebuilt, so only a start whose chunks are still
+/// being generated across the prune could lose placement state — keep the
+/// radius generous.
+pub fn set_start_cache_prune_radius(radius: u32) {
+    START_PRUNE_RADIUS.store(radius, Ordering::Relaxed);
+}
+pub(super) fn start_cache_prune_radius() -> i32 {
+    START_PRUNE_RADIUS.load(Ordering::Relaxed).min(i32::MAX as u32) as i32
+}
+/// Whether [`StructureResources::release_templates`] actually drops the
+/// cache (0) or is a no-op (1): a small-heap host whose cache is already
+/// count+byte bounded keeps it across the per-job `release_caches` calls —
+/// a structure assembly would otherwise re-read every template the last
+/// job decoded.
+static KEEP_TEMPLATE_CACHE: AtomicU32 = AtomicU32::new(0);
+/// Keep the bounded template cache resident across `release_caches` job
+/// boundaries (see [`KEEP_TEMPLATE_CACHE`]). Off stays the upstream
+/// behaviour.
+pub fn set_template_cache_persistent(persistent: bool) {
+    KEEP_TEMPLATE_CACHE.store(persistent as u32, Ordering::Relaxed);
+}
 
 /// A cached template: its decoded size (the byte bound) and the stamp of
 /// its last `template()` touch (the eviction pick, oldest first).
@@ -334,7 +384,11 @@ impl TemplateCache {
             }
         }
         self.bytes += bytes;
-        while (self.map.len() > TEMPLATE_CACHE_LIMIT || self.bytes > TEMPLATE_CACHE_BYTES)
+        let (entries, bytes) = (
+            TEMPLATE_LIMITS[0].load(Ordering::Relaxed),
+            TEMPLATE_LIMITS[1].load(Ordering::Relaxed),
+        );
+        while (self.map.len() > entries || self.bytes > bytes)
             && self.map.len() > 1
         {
             let victim = self
@@ -352,10 +406,20 @@ impl TemplateCache {
 /// Lazily loaded templates (`structure/<namespace>/<path>.nbt`, gzip NBT) and
 /// processor lists, shared by all generators of one resource bundle.
 pub struct StructureResources {
+    /// This resource bundle's own `Arc`, for the pool elements that fetch
+    /// their templates through it (`jigsaw::TemplateRef`).
+    this: std::sync::Weak<StructureResources>,
+    /// The prepare-packed mirror of `worldgen/` (`skyline-data.bin`):
+    /// template reads ask it first — its `structure/<id>.nbt` payloads are
+    /// `SKYT` digests (pre-resolved palettes, ~1/3 the decode cost) — and
+    /// fall back to the loose file when it doesn't have one.
+    packed: Option<Arc<dyn PackedWorldgen>>,
     pub registry: &'static BlockRegistry,
     pub transforms: StateTransforms,
     dir: PathBuf,
     templates: RwLock<TemplateCache>,
+    /// What assembly reads of the templates it has looked at (`template_meta`).
+    metas: RwLock<HashMap<String, Arc<TemplateMeta>>>,
     /// The stamp each `template()` touch takes (the LRU's order).
     template_tick: AtomicU32,
     /// Data packs' template files, which win over the prepared ones.
@@ -379,7 +443,9 @@ impl StructureResources {
         dir: &Path,
         processor_lists: BTreeMap<String, String>,
         block_tags: &BTreeMap<String, Vec<String>>,
-    ) -> Self {
+        packed: Option<Arc<dyn PackedWorldgen>>,
+        pack_templates: BTreeMap<String, Arc<[u8]>>,
+    ) -> Arc<Self> {
         let mut sources = BTreeSet::new();
         let fluids = crate::fluid::FluidStateTable::new(registry).ok();
         let mut jigsaw_states = BTreeMap::new();
@@ -416,7 +482,9 @@ impl StructureResources {
                 }
             }
         }
-        Self {
+        Arc::new_cyclic(|this| Self {
+            this: this.clone(),
+            packed,
             registry,
             transforms,
             dir: dir.to_owned(),
@@ -424,8 +492,9 @@ impl StructureResources {
                 map: HashMap::new(),
                 bytes: 0,
             }),
+            metas: RwLock::new(HashMap::new()),
             template_tick: AtomicU32::new(0),
-            pack_templates: BTreeMap::new(),
+            pack_templates,
             processor_lists,
             jigsaw_states,
             waterlogged,
@@ -434,52 +503,140 @@ impl StructureResources {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
                 .collect(),
-        }
+        })
     }
-    /// These resources with data packs' template files over the prepared ones.
-    pub fn with_pack_templates(mut self, templates: BTreeMap<String, Arc<[u8]>>) -> Self {
-        self.pack_templates = templates;
-        self
+    /// This bundle's `Arc` (always alive while `&self` is).
+    pub(crate) fn arc(&self) -> Arc<StructureResources> {
+        self.this.upgrade().expect("resources are built in an Arc")
+    }
+    /// Drop every cached template (the next `template()` loads it again) —
+    /// unless [`set_template_cache_persistent`] kept the bounded cache:
+    /// then the LRU's own bound is the only release it needs.
+    pub fn release_templates(&self) {
+        if KEEP_TEMPLATE_CACHE.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+        let mut cache = self.templates.write().unwrap();
+        cache.map = HashMap::new();
+        cache.bytes = 0;
+    }
+    /// Drop the cached [`TemplateMeta`]s (the next `template_meta` reads them again).
+    pub fn release_metas(&self) {
+        *self.metas.write().unwrap() = HashMap::new();
+    }
+    /// A template's size and jigsaw blocks, which is all that assembling a
+    /// structure reads of it. Read from the file without decoding its
+    /// blocks (`TemplateMeta::scan`); the full decode answers when the
+    /// scan does not recognize the file, so the result is the same either
+    /// way. Kept in a small map of its own: a meta is a few hundred bytes
+    /// where the template is kilobytes, and re-reading a village's worth
+    /// is what a cold start used to pay for on every assembly.
+    pub fn template_meta(&self, id: &str) -> Arc<TemplateMeta> {
+        let id: std::borrow::Cow<'_, str> = if id.contains(':') {
+            id.into()
+        } else {
+            format!("minecraft:{id}").into()
+        };
+        if let Some(found) = self.metas.read().unwrap().get(id.as_ref()) {
+            return found.clone();
+        }
+        let jigsaw_states = |state| self.jigsaw_horizontal(state);
+        let scanned = self.scan_meta(&id, &jigsaw_states);
+        let meta = Arc::new(scanned.unwrap_or_else(|| match self.template(&id) {
+            Some(template) => TemplateMeta::of(&template, &jigsaw_states),
+            None => TemplateMeta::of(&StructureTemplate::empty(), &jigsaw_states),
+        }));
+        let mut metas = self.metas.write().unwrap();
+        if metas.len() >= META_LIMIT {
+            metas.clear();
+        }
+        metas.insert(id.into_owned(), meta.clone());
+        meta
+    }
+    /// A template's stored bytes: a data pack's file first (it wins over
+    /// the prepared ones), then the packed mirror's
+    /// `structure/<namespace>/<path>.nbt` (a `SKYT` digest when the pack
+    /// digested it, else the file's own gzipped NBT), then the loose file
+    /// under `dir`.
+    fn template_bytes(&self, namespace: &str, path: &str) -> Option<Vec<u8>> {
+        if !self.pack_templates.is_empty()
+            && let Some(bytes) = self.pack_templates.get(&format!("{namespace}:{path}"))
+        {
+            return Some(bytes.to_vec());
+        }
+        if let Some(bytes) = self
+            .packed
+            .as_deref()
+            .and_then(|src| src.bytes(&format!("structure/{namespace}/{path}.nbt")))
+        {
+            return Some(bytes);
+        }
+        let file = self.dir.join(namespace).join(format!("{path}.nbt"));
+        horizon_core::prepared_files::read(&file).ok()
+    }
+    /// `bytes` as a template: the `SKYT` digest straight, else the gzipped
+    /// NBT's decode — either is the same template, the digest just skips
+    /// the parse.
+    fn decode_template(&self, bytes: &[u8]) -> Option<StructureTemplate> {
+        if StructureTemplate::is_digest(bytes) {
+            return StructureTemplate::from_digest(bytes);
+        }
+        let mut raw = Vec::new();
+        flate2::read::GzDecoder::new(bytes)
+            .read_to_end(&mut raw)
+            .ok()?;
+        let tag = nbt::read_named(&raw, Limits::templates()).ok()?.0.tag;
+        Some(StructureTemplate::from_nbt(
+            &tag,
+            self.registry,
+            &self.transforms,
+        ))
+    }
+    fn scan_meta(
+        &self,
+        id: &str,
+        jigsaw_states: &dyn Fn(BlockStateId) -> Option<bool>,
+    ) -> Option<TemplateMeta> {
+        let (namespace, path) = id.split_once(':')?;
+        let bytes = self.template_bytes(namespace, path)?;
+        if StructureTemplate::is_digest(&bytes) {
+            return self
+                .decode_template(&bytes)
+                .map(|t| TemplateMeta::of(&t, jigsaw_states));
+        }
+        let mut raw = Vec::new();
+        flate2::read::GzDecoder::new(bytes.as_slice())
+            .read_to_end(&mut raw)
+            .ok()?;
+        drop(bytes);
+        TemplateMeta::scan(&raw, self.registry, &self.transforms, jigsaw_states)
     }
     /// StructureTemplateManager.getOrCreate; missing templates are empty.
     pub fn template(&self, id: &str) -> Option<Arc<StructureTemplate>> {
-        let id = if id.contains(':') {
-            id.to_owned()
+        let id: std::borrow::Cow<'_, str> = if id.contains(':') {
+            id.into()
         } else {
-            format!("minecraft:{id}")
+            format!("minecraft:{id}").into()
         };
+        let id = id.as_ref();
         let tick = self.template_tick.fetch_add(1, Ordering::Relaxed);
-        if let Some(found) = self.templates.read().unwrap().map.get(&id) {
+        if let Some(found) = self.templates.read().unwrap().map.get(id) {
             found.tick.store(tick, Ordering::Relaxed);
             return found.template.clone();
         }
         let (namespace, path) = id.split_once(':').unwrap();
-        let file = self.dir.join(namespace).join(format!("{path}.nbt"));
-        let bytes = match self.pack_templates.get(&id) {
-            Some(bytes) => Some(bytes.to_vec()),
-            None => horizon_core::prepared_files::read(&file).ok(),
-        };
-        let loaded = bytes.and_then(|bytes| {
-            let mut raw = Vec::new();
-            flate2::read::GzDecoder::new(bytes.as_slice())
-                .read_to_end(&mut raw)
-                .ok()?;
-            let tag = nbt::read_named(&raw, Limits::templates()).ok()?.0.tag;
-            Some(StructureTemplate::from_nbt(
-                &tag,
-                self.registry,
-                &self.transforms,
-            ))
+        let loaded = self.template_bytes(namespace, path).and_then(|bytes| {
+            self.decode_template(&bytes)
         });
         // StructureTemplateManager.getOrCreate: missing templates are empty.
         let mut loaded = loaded.unwrap_or_else(StructureTemplate::empty);
-        loaded.location = id.as_str().into();
+        loaded.location = id.into();
         let loaded = Some(Arc::new(loaded));
         let bytes = loaded.as_ref().map_or(0, |t| t.heap_bytes());
         self.templates
             .write()
             .unwrap()
-            .insert(id, loaded.clone(), bytes, tick);
+            .insert(id.to_owned(), loaded.clone(), bytes, tick);
         loaded
     }
     /// Whether the state's fluid is a source (water/lava level 0, waterlogged).

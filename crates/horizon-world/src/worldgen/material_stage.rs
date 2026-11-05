@@ -404,8 +404,14 @@ where
     R::Positional: Clone,
 {
     let min = chunk.min_y();
+    // No vein places a block above it (`ore_vein_top`): the sampled volume
+    // ends there, so the column gate reads only up to it.
+    let vein_top = rule.ore_vein_top();
     let rule = worker.add_shared_rule(rule, shared)?;
     let mut variants = worker.surface_variants(rule)?;
+    // Every column needs the lowest slice of the vein densities, and a failing
+    // one is better found before any column is written.
+    worker.prepare_densities(&variants.gates)?;
     let cx = chunk.position().x.wrapping_shl(4);
     let cz = chunk.position().z.wrapping_shl(4);
     // One block buffer, refilled per column and kept across columns.
@@ -447,6 +453,13 @@ where
                 (lz - 1).max(0),
             )?);
             worker.update_xz(x, z, gx, gz);
+            // Ore veins act where their density is positive, which it rarely is:
+            // columns it is not positive anywhere in take the rules without them.
+            let veins = variants.gates.is_empty() || {
+                let low = write_min_y.max(min);
+                let high = top.min(write_max_y).min(vein_top);
+                low > high || worker.veins_possible(&variants.gates, x, z, low, high)?
+            };
             let mut above = 0i32;
             let mut water = i32::MIN;
             let mut bottom = i32::MAX;
@@ -497,7 +510,7 @@ where
                             }
                             // Where the rule gives no block, the block's context
                             // is not needed: each application sets its own first.
-                            if let Some(rule) = worker.surface_variant(&mut variants, band, surface)
+                            if let Some(rule) = worker.surface_variant(&mut variants, band, surface, veins)
                             {
                                 worker.update_y(
                                     above,

@@ -41,6 +41,17 @@ fn clamp(value: f32, min: f32, max: f32) -> f32 {
         java_min(value, max)
     }
 }
+/// `clamp(value, -1.0, 1.0)`. Inside the range (zeros of either sign included,
+/// NaN excluded) that is `value` itself, and an integer compare of the
+/// magnitude bits tells so: float compares cost a flag transfer each on VFP11.
+#[inline(always)]
+fn clamp_unit(value: f32) -> f32 {
+    if value.to_bits() & 0x7fff_ffff <= 0x3f80_0000 {
+        value
+    } else {
+        clamp(value, -1.0, 1.0)
+    }
+}
 
 /// Selected compiled unary samplers, including constant-operand specializations.
 /// Graph compilation is implemented separately.
@@ -98,7 +109,7 @@ macro_rules! unary_apply {
                 }
             }
             Self::Squeeze => {
-                let v = clamp(value, -1.0, 1.0);
+                let v = clamp_unit(value);
                 v / 2.0 - v * v * v / 24.0
             }
             Self::LeakyRelu(factor) => {
@@ -503,6 +514,52 @@ mod bulk_tests {
                     );
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod clamp_unit_tests {
+    use super::*;
+
+    #[test]
+    fn clamp_unit_is_clamp_to_the_unit_range_bit_for_bit() {
+        let mut cases = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            f32::from_bits(0x3f80_0001),
+            f32::from_bits(0xbf80_0001),
+            f32::from_bits(0x3f7f_ffff),
+            f32::from_bits(0xbf7f_ffff),
+            f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::from_bits(0x8000_0001),
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -f32::NAN,
+            f32::from_bits(0x7fa0_0000),
+            f32::from_bits(0xffc0_1234),
+            f32::MAX,
+            f32::MIN,
+        ];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..200_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            cases.push(f32::from_bits(state as u32));
+            cases.push((state >> 40) as f32 / 8_388_608.0 - 1.0);
+        }
+        for value in cases {
+            assert_eq!(
+                clamp_unit(value).to_bits(),
+                clamp(value, -1.0, 1.0).to_bits(),
+                "{:#x}",
+                value.to_bits()
+            );
         }
     }
 }

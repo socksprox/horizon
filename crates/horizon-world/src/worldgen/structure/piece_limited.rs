@@ -201,7 +201,8 @@ impl Counts {
         let PoolElement::Single { template, .. } = element else {
             return None;
         };
-        self.0.iter().position(|t| Arc::ptr_eq(t, template))
+        // By id: a template evicted and loaded again is another `Arc`.
+        self.0.iter().position(|t| *t.location == *template.location())
     }
 }
 
@@ -690,7 +691,7 @@ struct Assembler<'a> {
 /// Where a child goes: the parent's jigsaw and what it needs.
 struct Slot<'s> {
     source: usize,
-    jigsaw: &'s super::jigsaw::Jigsaw<'s>,
+    jigsaw: &'s super::jigsaw::Jigsaw,
     target_pos: [i32; 3],
     free: Rc<RefCell<Free>>,
     depth: i32,
@@ -720,7 +721,7 @@ impl Assembler<'_> {
             let Some(target) = self.pool(&jigsaw.pool) else {
                 continue;
             };
-            if target.templates.is_empty() && jigsaw.pool != "minecraft:empty" {
+            if target.templates.is_empty() && &*jigsaw.pool != "minecraft:empty" {
                 continue;
             }
             let s = step(jigsaw.front);
@@ -794,7 +795,7 @@ impl Assembler<'_> {
                 let need_template = &self.counted.0[need_index];
                 let found = candidates.iter().position(|(e, _)| {
                     matches!(e.as_ref(), PoolElement::Single { template, .. }
-                        if Arc::ptr_eq(template, need_template))
+                        if *need_template.location == *template.location())
                 });
                 if let Some(i) = found {
                     if slot.depth >= (self.config.max_depth - 1).min(need.min_depth) {
@@ -1028,7 +1029,7 @@ mod tests {
     fn repurposed_moves_junctions_as_its_code_does() {
         let template = Arc::new(StructureTemplate::empty());
         let element = Arc::new(PoolElement::Single {
-            template,
+            template: template.into(),
             processors: Default::default(),
             processors_source: serde_json::Value::Null,
             legacy: false,

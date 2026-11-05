@@ -20,8 +20,15 @@ pub(crate) const MAGIC_LEN: usize = 1 << 14;
 /// The multiply-shift replaces a ~20-26 cycle x86 divide, but arm64's divider
 /// is as cheap as the table lookup: measured on an Apple M-series CPU, 65k
 /// reads took 1.5 ms with the division and 2.5 ms with the table (bits 4-16),
-/// so only the x86 targets take the table.
-const MAGIC_BEATS_DIVISION: bool = cfg!(any(target_arch = "x86", target_arch = "x86_64"));
+/// so only the x86 targets take the table. 32-bit ARM takes it too: no core
+/// before ARMv7VE has an integer divider, so every `index / per_word` is a
+/// `__aeabi_uidivmod` software-division call (tens of cycles) on e.g. the
+/// 3DS's ARM11, against a table lookup and a multiply.
+const MAGIC_BEATS_DIVISION: bool = cfg!(any(
+    target_arch = "x86",
+    target_arch = "x86_64",
+    target_arch = "arm"
+));
 /// The word and bit shift of entry `i`; exact for `i < MAGIC_LEN`.
 #[inline]
 pub(crate) fn locate(bits: u8, i: usize) -> (usize, u32) {
@@ -153,6 +160,7 @@ impl PackedStorage {
         Ok(self.slot(index))
     }
 
+    #[inline]
     pub fn get(&self, index: usize) -> Result<u32, StorageError> {
         let (word, shift) = self.location(index)?;
         Ok(((self.words[word] >> shift) & self.mask) as u32)
@@ -182,6 +190,7 @@ impl PackedStorage {
 
     /// Validation fails before mutation. Writes accept nonnegative Java ints;
     /// imported 32-bit words may still decode to any u32 bit pattern.
+    #[inline]
     pub fn set(&mut self, index: usize, value: u32) -> Result<u32, StorageError> {
         let (word, shift) = self.location(index)?;
         if u64::from(value) > self.mask || value > i32::MAX as u32 {

@@ -49,7 +49,7 @@ fn registry() -> &'static BlockRegistry {
 
 /// A registry whose states rotate and mirror onto themselves, so a processor
 /// list decodes without a prepared resource bundle.
-fn resources() -> StructureResources {
+fn resources() -> std::sync::Arc<StructureResources> {
     let registry = registry();
     let states = registry.len();
     let table = json!({
@@ -64,6 +64,8 @@ fn resources() -> StructureResources {
         Path::new("."),
         BTreeMap::new(),
         &BTreeMap::new(),
+        None,
+        BTreeMap::new(),
     )
 }
 

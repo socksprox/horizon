@@ -52,7 +52,7 @@ use horizon_core::{
 use serde_json::Value;
 use std::{
     any::Any,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs, io,
     path::Path,
     sync::{Arc, Mutex, OnceLock},
@@ -682,16 +682,14 @@ impl GeneratorData {
                 let Some(json) = json else {
                     return Ok(None);
                 };
-                Ok(Some(Arc::new(
-                    super::structure::StructureResources::new(
-                        registry,
-                        super::structure::StateTransforms::from_json(&json, registry.len())?,
-                        &dir.join("structure"),
-                        read_optional_bundle(&dir, &ov, src, "processor_lists")?
-                            .unwrap_or_default(),
-                        &tags,
-                    )
-                    .with_pack_templates(ov.templates().clone()),
+                Ok(Some(super::structure::StructureResources::new(
+                    registry,
+                    super::structure::StateTransforms::from_json(&json, registry.len())?,
+                    &dir.join("structure"),
+                    read_optional_bundle(&dir, &ov, src, "processor_lists")?.unwrap_or_default(),
+                    &tags,
+                    packed.clone(),
+                    ov.templates().clone(),
                 )))
             }
         })?;
@@ -1066,13 +1064,15 @@ impl GeneratorData {
             *guard = match json {
                 Some(json) => {
                     let tags = self.block_tags()?;
-                    Resident::Present(Arc::new(super::structure::StructureResources::new(
+                    Resident::Present(super::structure::StructureResources::new(
                         self.registry,
                         super::structure::StateTransforms::from_json(&json, self.registry.len())?,
                         &dir.join("structure"),
                         read_optional_bundle(dir, ov, src, "processor_lists")?.unwrap_or_default(),
                         &tags,
-                    )))
+                        self.packed.clone(),
+                        ov.templates().clone(),
+                    ))
                 }
                 None => Resident::Absent,
             };
@@ -1521,10 +1521,9 @@ pub struct FlatSettings {
     /// `lakes`: the lava lakes (`createLakesList`) take the biome's lakes step.
     pub lakes: bool,
 }
-/// Biome-chunk cache cap — upstream's 16,384-entry map (~6 KB a chunk)
-/// could grow to ~100 MB over a long session; 64 covers several
-/// decorate hoods (9 each) at ~400 KB. On overflow the whole cache
-/// clears, so a cap this small only rebuilds climate samples, never
+/// Carver-biome cache cap (`CACHE_LIMIT * 4` entries) — upstream's
+/// 16,384-entry maps could grow to ~100 MB over a long session. On overflow
+/// it clears, so a cap this small only rebuilds climate samples, never
 /// results.
 const CACHE_LIMIT: usize = 64;
 /// What a generator's shared caches hold ([`OverworldGenerator::cache_census`]).
@@ -1539,6 +1538,13 @@ pub struct CacheCensus {
     pub start_chunks: usize,
     pub start_lists: usize,
 }
+/// Biome-chunk cache cap — ~6 KB a chunk, ~0.8 MB in all. Generating a chunk
+/// reads its 3x3 hood, so a sweep revisits each biome chunk from up to nine
+/// neighbours: a spiral of radius r needs ~16r + 8 entries to build each one
+/// once (128 matches an unbounded cache up to r = 7, and a 21-wide row scan;
+/// a wider spiral rebuilds some hoods): 0.6 ms a chunk of biomes against
+/// 1.4 with the old 64-entry wipe.
+const BIOME_CACHE_LIMIT: usize = 128;
 /// Coordinates only equal missing neighbour keys. Weak entries retain no
 /// computed values across eviction or explicit invalidation. Only one work
 /// lock may be held at a time; finish shared prerequisites before acquiring it.
@@ -1570,7 +1576,37 @@ impl ChunkWork {
     }
 }
 
-type BiomeCache = Mutex<HashMap<(i32, i32), Arc<BiomeChunk<BiomeId>>>>;
+/// The built biome chunks by position, at most [`BIOME_CACHE_LIMIT`]: the
+/// oldest insertion makes room for a new one (a sweep's hood is the newest),
+/// never the whole cache at once. Only the climate samples are rebuilt on a
+/// miss, never different results.
+#[derive(Default)]
+struct BiomeChunks {
+    map: HashMap<(i32, i32), Arc<BiomeChunk<BiomeId>>>,
+    /// The cached positions, oldest first.
+    order: VecDeque<(i32, i32)>,
+}
+impl BiomeChunks {
+    fn get(&self, key: &(i32, i32)) -> Option<&Arc<BiomeChunk<BiomeId>>> {
+        self.map.get(key)
+    }
+    fn insert(&mut self, key: (i32, i32), chunk: Arc<BiomeChunk<BiomeId>>) {
+        if self.map.insert(key, chunk).is_some() {
+            return;
+        }
+        if self.order.len() >= BIOME_CACHE_LIMIT
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.map.remove(&oldest);
+        }
+        self.order.push_back(key);
+    }
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+type BiomeCache = Mutex<BiomeChunks>;
 
 /// `NoiseGeneratorSettings`' `default_block` and `default_fluid`: a block state
 /// in 26.3's form, the id alone or `{"id", "properties"}`.
@@ -1781,7 +1817,7 @@ where
             noises,
             extensions,
             picker,
-            biome_cache: Mutex::new(HashMap::new()),
+            biome_cache: Mutex::new(BiomeChunks::default()),
             biome_work: ChunkWork::new(),
             carver_cache: Mutex::new(HashMap::new()),
             decoration: None,
@@ -1972,11 +2008,10 @@ where
             })
             .map_err(stage("biomes"))?;
         let chunk = Arc::new(chunk);
-        let mut cache = self.biome_cache.lock().unwrap();
-        if cache.len() >= CACHE_LIMIT {
-            cache.clear();
-        }
-        cache.insert((pos.x, pos.z), chunk.clone());
+        self.biome_cache
+            .lock()
+            .unwrap()
+            .insert((pos.x, pos.z), chunk.clone());
         Ok(Some(chunk))
     }
     fn carver_biome(&self, worker: &mut WorkerState, origin: ChunkPos) -> Result<BiomeId, String> {
@@ -3121,6 +3156,8 @@ trait SeededPipeline: Send + Sync {
         pieces: &[serde_json::Value],
     ) -> Result<(), String>;
     fn forget_structure_starts(&self);
+    fn release_structure_decodes(&self);
+    fn release_structure_metas(&self);
     fn ring_positions(&self, worker: &mut WorkerState, set: &str) -> Option<Vec<ChunkPos>>;
     /// The structures whose random-spread set may start in `chunk`, each with whether a
     /// search's start check lets it start there.
@@ -3236,12 +3273,14 @@ where
             .as_ref()
             .map_or((0, 0), |s| s.start_census());
         CacheCensus {
-            biome_chunks: biomes.len(),
+            biome_chunks: biomes.map.len(),
             biome_bytes: biomes
+                .map
                 .values()
                 .map(|b| std::mem::size_of::<BiomeChunk<BiomeId>>() + b.heap_bytes())
                 .sum::<usize>()
-                + biomes.capacity() * std::mem::size_of::<((i32, i32), usize)>(),
+                + biomes.map.capacity() * std::mem::size_of::<((i32, i32), usize)>()
+                + biomes.order.capacity() * std::mem::size_of::<(i32, i32)>(),
             carver_entries: self.carver_cache.lock().unwrap().len(),
             start_chunks,
             start_lists,
@@ -3345,6 +3384,16 @@ where
                 chunk,
             ),
             None => Vec::new(),
+        }
+    }
+    fn release_structure_decodes(&self) {
+        if let Some(structures) = &self.structures {
+            structures.release_decodes();
+        }
+    }
+    fn release_structure_metas(&self) {
+        if let Some(structures) = &self.structures {
+            structures.release_metas();
         }
     }
     fn ring_positions(&self, worker: &mut WorkerState, set: &str) -> Option<Vec<ChunkPos>> {
@@ -4605,12 +4654,29 @@ impl GeneratorWorker {
         ] {
             context.clear_scratch();
         }
-        state.carver_biomes = HashMap::new();
-        state.structure_biomes = HashMap::new();
-        state.heights = HashMap::new();
+        self.release_caches();
+        // The template metas `release_caches` keeps (see there).
+        self.pipeline.release_structure_metas();
         // The terrain fill's thread-local density scratch (~400 KiB a
         // worker thread, never otherwise freed).
         super::terrain::release_density_scratch();
+    }
+    /// Give back only the lookup caches (carver/structure biomes, heights)
+    /// and the structure assembly's decodes (template pools, the loaded
+    /// templates; not the small template metas, which `release` drops):
+    /// each lookup cache is capped at tens of thousands of
+    /// entries and its `HashMap` grows by infallible doubling (up to ~2.7 MB
+    /// blocks), unlike the density scratch, which grows through
+    /// `try_reserve`; the decodes reload (identically) when the next
+    /// structure assembles. A host that keeps the scratch resident between
+    /// jobs calls this after each one so the maps never get past a job's
+    /// worth of entries.
+    pub fn release_caches(&mut self) {
+        let state = &mut self.state;
+        state.carver_biomes = HashMap::new();
+        state.structure_biomes = HashMap::new();
+        state.heights = HashMap::new();
+        self.pipeline.release_structure_decodes();
     }
 }
 
@@ -5641,18 +5707,25 @@ mod tests {
                 assert!(Arc::ptr_eq(first, other));
             }
         }
-        // Force the existing whole-cache biome eviction threshold.
+        // Force the biome cache's eviction threshold: the oldest chunk goes,
+        // the rest stay.
         {
             let mut cache = pipeline.biome_cache.lock().unwrap();
-            cache.clear();
-            for x in 0..CACHE_LIMIT as i32 {
+            *cache = BiomeChunks::default();
+            for x in 0..BIOME_CACHE_LIMIT as i32 {
                 cache.insert((x, 10000), biomes.clone());
             }
         }
         let mut worker = generator.worker();
         let rebuilt = pipeline.biome_chunk(&mut worker.state, pos).unwrap();
         assert!(!Arc::ptr_eq(biomes, &rebuilt));
-        assert_eq!(pipeline.biome_cache.lock().unwrap().len(), 1);
+        {
+            let cache = pipeline.biome_cache.lock().unwrap();
+            assert_eq!(cache.len(), BIOME_CACHE_LIMIT);
+            assert!(cache.get(&(0, 10000)).is_none());
+            assert!(cache.get(&(1, 10000)).is_some());
+            assert!(Arc::ptr_eq(cache.get(&(pos.x, pos.z)).unwrap(), &rebuilt));
+        }
         for section in 0..24 {
             assert_eq!(biomes.section(section), rebuilt.section(section));
         }

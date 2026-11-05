@@ -430,13 +430,9 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
             return Ok(state);
         }
         let previous = self.set_block_raw(x, y, z, state)?;
+        // Empty (no allocation) unless a stage map is missing: growth is
+        // reserved fallibly at the push, not up front on every write.
         let mut missing = Vec::new();
-        missing
-            .try_reserve(self.stage.heightmaps().len())
-            .map_err(|_| {
-                horizon_core::alloc::note();
-                TerrainError::Alloc
-            })?;
         for &kind in self.stage.heightmaps() {
             match self.heightmap(kind) {
                 // `Heightmap::update` would return at once: no state is read.
@@ -448,7 +444,13 @@ impl<'r, B: TerrainBlockStates> TerrainChunk<'r, B> {
                 Some(_) => {
                     self.update_heightmap(kind, x & 15, y, z & 15, state)?;
                 }
-                None => missing.push(kind),
+                None => {
+                    missing.try_reserve(1).map_err(|_| {
+                        horizon_core::alloc::note();
+                        TerrainError::Alloc
+                    })?;
+                    missing.push(kind)
+                }
             }
         }
         if !missing.is_empty() {

@@ -562,6 +562,8 @@ mod tests {
             Path::new("/nonexistent"),
             BTreeMap::new(),
             &BTreeMap::new(),
+            None,
+            BTreeMap::new(),
         );
         let piece = piece(registry);
         let mut world = World::new(registry, sea);

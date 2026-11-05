@@ -170,6 +170,10 @@ impl RingWork {
     }
 }
 const START_CACHE_LIMIT: usize = 65536;
+/// Entries (all shards) from which an insert prunes by distance when
+/// `set_start_cache_prune_radius` asked for it: the window plus a chunk's
+/// reference reach is ~1.5k chunks.
+const START_PRUNE_AT: usize = 4096;
 const START_SHARDS: usize = 64;
 
 /// The built starts by chunk, in shards: a lookup locks one shard for
@@ -233,6 +237,16 @@ impl StartCache {
     fn insert_first(&self, key: (i32, i32), starts: Starts) -> Starts {
         let mut shard = self.shard(key).write().unwrap();
         let first = shard.new.remove(&key).or_else(|| shard.old.remove(&key));
+        // A small heap's bound (`set_start_cache_prune_radius`): past
+        // `START_PRUNE_AT`, keep only the starts near the one coming in.
+        let radius = super::structure::start_cache_prune_radius();
+        if radius > 0 && shard.new.len() + shard.old.len() >= START_PRUNE_AT / START_SHARDS {
+            let near = |k: &(i32, i32), _: &mut Starts| {
+                (k.0 - key.0).abs().max((k.1 - key.1).abs()) <= radius
+            };
+            shard.new.retain(near);
+            shard.old.retain(near);
+        }
         shard.make_room();
         shard
             .new
@@ -480,6 +494,16 @@ impl StructureState {
         // As before, a build already in flight can publish after this clear.
         // Do not wait for work locks or retain initialized entries here.
         self.starts.clear();
+    }
+    /// Drop the decoded pools and cached templates: they only save the next
+    /// structure assembly a decode, and each pool pins its templates.
+    pub(super) fn release_decodes(&self) {
+        self.registry.pools.release();
+        self.resources.release_templates();
+    }
+    /// Drop the template metas (what assembly reads of a template).
+    pub(super) fn release_metas(&self) {
+        self.resources.release_metas();
     }
     /// The (cached) structure starts owned by a chunk.
     pub(super) fn starts_at(

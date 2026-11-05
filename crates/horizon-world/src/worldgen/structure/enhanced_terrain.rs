@@ -303,7 +303,7 @@ mod tests {
 
     fn element(projection: Projection, own: Option<Adaptation>) -> Arc<PoolElement> {
         Arc::new(PoolElement::Single {
-            template: Arc::new(StructureTemplate::empty()),
+            template: Arc::new(StructureTemplate::empty()).into(),
             processors: Default::default(),
             processors_source: serde_json::Value::Null,
             legacy: false,

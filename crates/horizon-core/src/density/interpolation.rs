@@ -190,7 +190,8 @@ impl DensitySampler for InterpolatedSampler {
     ) -> Result<f32, SampleError> {
         let remainder: [i32; 3] =
             std::array::from_fn(|i| position[i].rem_euclid(self.cell_size[i]));
-        if remainder == [0; 3] {
+        // Not `remainder == [0; 3]`: 32-bit ARM compares arrays through `memcmp`.
+        if remainder[0] == 0 && remainder[1] == 0 && remainder[2] == 0 {
             return self.input.sample_value(context, position);
         }
         let volume = DensityVolume::new(
@@ -241,7 +242,7 @@ impl DensitySampler for InterpolatedSampler {
         }) {
             return self.input.sample_volume(context, output, volume);
         }
-        if volume.steps() == [1; 3] {
+        if volume.steps().iter().all(|&step| step == 1) {
             return self.sample_block_volume(context, output, volume);
         }
         // The reference evaluates the complete block-resolution bounding volume

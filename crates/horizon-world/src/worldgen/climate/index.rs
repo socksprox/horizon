@@ -151,6 +151,100 @@ const BOUND: i64 = 1 << 29;
 fn bounded(value: i64) -> bool {
     -BOUND < value && value < BOUND
 }
+/// Largest magnitude of a bound or target value the 32-bit search takes. With
+/// every value inside, a distance is below 2^29, its square below 2^58 and the
+/// seven-term sum below 2^61: no wrap anywhere, so the narrow search sums the
+/// exact numbers [`SearchSpace::distance`] does. Quantized biome climate values
+/// are a few tens of thousands, so vanilla's lists are always narrow.
+const NARROW: i64 = 1 << 28;
+/// A [`SearchSpace`] as `i32` bounds: on 32-bit ARM (the 3DS) a squared
+/// distance is one 32x32 -> 64-bit multiply instead of a 64-bit multiply's
+/// three, and the box is half the size.
+#[derive(Clone, Copy, Debug)]
+struct NarrowSpace {
+    coordinates: [[i32; 2]; 6],
+    /// The offset interval's squared distance from 0, as `SearchSpace::offset`.
+    offset: u64,
+}
+impl NarrowSpace {
+    fn new(space: &[Parameter; 7]) -> Option<Self> {
+        let mut bounds = [[0; 2]; 7];
+        for (out, parameter) in bounds.iter_mut().zip(space) {
+            // Ordered, so a value is above `max` or below `min`, never both.
+            if !(-NARROW..=NARROW).contains(&parameter.min)
+                || !(-NARROW..=NARROW).contains(&parameter.max)
+                || parameter.min > parameter.max
+            {
+                return None;
+            }
+            *out = [parameter.min as i32, parameter.max as i32];
+        }
+        let [min, max] = bounds[6];
+        Some(Self {
+            coordinates: std::array::from_fn(|i| bounds[i]),
+            offset: narrow_square(min, max, 0),
+        })
+    }
+    fn wide(&self) -> SearchSpace {
+        SearchSpace {
+            coordinates: self
+                .coordinates
+                .map(|[min, max]| Parameter::new(min.into(), max.into())),
+            offset: self.offset as i64,
+        }
+    }
+    /// [`SearchSpace::distance`] over narrow bounds.
+    #[inline]
+    fn distance(&self, values: &[i32; 6]) -> u64 {
+        let mut sum = self.offset;
+        for (&[min, max], &value) in self.coordinates.iter().zip(values) {
+            sum += narrow_square(min, max, value);
+        }
+        sum
+    }
+    /// [`SearchSpace::distance_until`] over narrow bounds: the sum only grows,
+    /// so once it reaches `limit` the rest are skipped. One check after the
+    /// first four axes (in [`AXES`] order) and one at the end: a compare per
+    /// axis costs the 32-bit ARM code more than the arithmetic it saves.
+    #[inline]
+    fn distance_until(&self, values: &[i32; 6], limit: u64) -> u64 {
+        let term = |axis: usize| {
+            let [min, max] = self.coordinates[axis];
+            narrow_square(min, max, values[axis])
+        };
+        let sum = self.offset + term(AXES[0]) + term(AXES[1]) + term(AXES[2]) + term(AXES[3]);
+        if sum >= limit {
+            return sum;
+        }
+        sum + term(AXES[4]) + term(AXES[5])
+    }
+}
+/// The target's six values as `i32`, when all are within [`NARROW`].
+fn narrow_values(values: &[i64; 6]) -> Option<[i32; 6]> {
+    let mut out = [0; 6];
+    for (out, value) in out.iter_mut().zip(values) {
+        // One unsigned compare for -NARROW..=NARROW.
+        if value.wrapping_add(NARROW) as u64 > 2 * NARROW as u64 {
+            return None;
+        }
+        *out = *value as i32;
+    }
+    Some(out)
+}
+/// `max(x, 0)` without a compare: no predicated instructions to the 32-bit ARM
+/// code (a conditional per parameter costs more than the arithmetic does, and
+/// splits blocks in JIT emulators).
+#[inline(always)]
+fn positive(x: i32) -> i32 {
+    x & !(x >> 31)
+}
+/// One parameter's squared distance, as [`Parameter::distance`] squared: for an
+/// ordered span at most one of `above` and `below` is positive.
+#[inline(always)]
+fn narrow_square(min: i32, max: i32, value: i32) -> u64 {
+    let distance = (positive(value - max) + positive(min - value)) as u32;
+    u64::from(distance) * u64::from(distance)
+}
 fn compare_space(a: &[Parameter; 7], b: &[Parameter; 7], axis: usize, absolute: bool) -> Ordering {
     for i in 0..7 {
         let coordinate = (axis + i) % 7;
@@ -250,7 +344,11 @@ pub struct ClimateIndex<T> {
     entries: Vec<(ParameterPoint, T)>,
     /// The built tree renumbered breadth first, root at 0, so each branch's
     /// children are one contiguous run and a search walks memory in order.
+    /// Empty when `narrow` holds the same boxes.
     spaces: Vec<SearchSpace>,
+    /// `spaces` as `i32` bounds, when every bound is within [`NARROW`]
+    /// (always, for biome data); then `spaces` is not kept.
+    narrow: Vec<NarrowSpace>,
     /// Every bound of every box, offsets included, is bounded.
     bounded: bool,
     /// Per node: its first child and child count, or its entry and 0 for a leaf.
@@ -304,12 +402,24 @@ impl<T> ClimateIndex<T> {
                 .iter()
                 .all(|parameter| bounded(parameter.min) && bounded(parameter.max))
         });
+        let narrow: Option<Vec<_>> = order
+            .iter()
+            .map(|id| NarrowSpace::new(&nodes[*id].space))
+            .collect();
+        let (spaces, narrow) = match narrow {
+            Some(narrow) => (Vec::new(), narrow),
+            None => (
+                order
+                    .iter()
+                    .map(|id| SearchSpace::new(&nodes[*id].space))
+                    .collect(),
+                Vec::new(),
+            ),
+        };
         Ok(Self {
             entries,
-            spaces: order
-                .iter()
-                .map(|id| SearchSpace::new(&nodes[*id].space))
-                .collect(),
+            spaces,
+            narrow,
             bounded,
             links,
         })
@@ -353,6 +463,41 @@ impl<T> ClimateIndex<T> {
         walk(&self.links, 0, &mut result);
         result
     }
+    /// Node `id`'s box, widened from `narrow` when that is what is kept.
+    fn space(&self, id: usize) -> SearchSpace {
+        match self.spaces.get(id) {
+            Some(space) => *space,
+            None => self.narrow[id].wide(),
+        }
+    }
+    /// [`search`](Self::search) over the narrow boxes with a narrow target:
+    /// the same sums (no term wraps), so the same nodes are visited in the
+    /// same order and the same leaf is found.
+    fn search_narrow(
+        &self,
+        id: usize,
+        values: &[i32; 6],
+        mut best: Option<usize>,
+        mut fitness: u64,
+    ) -> Result<(usize, u64), IndexError> {
+        let (first, count) = self.links[id];
+        let children = first as usize..(first + count) as usize;
+        for (child, space) in children.clone().zip(&self.narrow[children]) {
+            let lower = space.distance_until(values, fitness);
+            if fitness > lower {
+                let (result, next) = if self.links[child].1 == 0 {
+                    (child, lower)
+                } else {
+                    self.search_narrow(child, values, best, fitness)?
+                };
+                if fitness > next {
+                    fitness = next;
+                    best = Some(result);
+                }
+            }
+        }
+        best.map(|best| (best, fitness)).ok_or(IndexError::NoResult)
+    }
     /// Vanilla's `SubTree.search` below `id`, whose best leaf so far is `best`
     /// at distance `fitness` (`i64::MAX` with none), returning the best leaf
     /// and its distance. Vanilla measures the best leaf again in every subtree
@@ -367,8 +512,8 @@ impl<T> ClimateIndex<T> {
         mut fitness: i64,
     ) -> Result<(usize, i64), IndexError> {
         let (first, count) = self.links[id];
-        let children = first as usize..(first + count) as usize;
-        for (child, space) in children.clone().zip(&self.spaces[children]) {
+        for child in first as usize..(first + count) as usize {
+            let space = self.space(child);
             let lower = if bounded {
                 space.distance_until(values, fitness)
             } else {
@@ -398,12 +543,23 @@ impl<'a, T> ClimateSearch<'a, T> {
     pub fn find(&mut self, target: TargetPoint) -> Result<&'a T, IndexError> {
         let parameters = target.parameters();
         let values = std::array::from_fn(|i| parameters[i]);
+        let narrow = match narrow_values(&values) {
+            Some(narrow) if !self.index.narrow.is_empty() => Some(narrow),
+            _ => None,
+        };
         let result = if self.index.links[0].1 == 0 {
             0
+        } else if let Some(narrow) = narrow {
+            let fitness = self
+                .last
+                .map_or(u64::MAX, |id| self.index.narrow[id].distance(&narrow));
+            self.index
+                .search_narrow(0, &narrow, self.last, fitness)?
+                .0
         } else {
             let fitness = self
                 .last
-                .map_or(i64::MAX, |id| self.index.spaces[id].distance(&values));
+                .map_or(i64::MAX, |id| self.index.space(id).distance(&values));
             let bounded = self.index.bounded && values.iter().all(|value| bounded(*value));
             self.index
                 .search(0, &values, bounded, self.last, fitness)?
@@ -708,5 +864,86 @@ mod tests {
         }
         // Extreme spans can leave no finite split cost; most trees build.
         assert!(built > 220, "{built} trees built");
+    }
+
+    /// Climate-scale trees keep only their 32-bit boxes, and the narrow search
+    /// finds the reference's leaf for every target, including targets past the
+    /// narrow bound that take the 64-bit search over the widened boxes.
+    #[test]
+    fn narrow_search_matches_the_reference() {
+        let mut rng = Rng(0x3d5);
+        let scale = 20_000;
+        let entries: Vec<(ParameterPoint, usize)> = (0..700)
+            .map(|id| {
+                let point = ParameterPoint {
+                    coordinates: std::array::from_fn(|_| {
+                        let (a, b) = (rng.range(-scale, scale), rng.range(-scale, scale));
+                        Parameter::new(a.min(b), a.max(b))
+                    }),
+                    offset: rng.range(0, 9_999),
+                };
+                (point, id)
+            })
+            .collect();
+        let index = ClimateIndex::new(entries.clone()).unwrap();
+        assert!(!index.narrow.is_empty() && index.spaces.is_empty());
+        let mut targets = walk(&mut rng, &entries, 6000, scale * 3 / 2);
+        let extremes = [i64::MAX, i64::MIN, NARROW, -NARROW, NARROW + 1, -NARROW - 1];
+        for (i, target) in targets.iter_mut().enumerate().step_by(97) {
+            target.depth = extremes[i / 97 % extremes.len()];
+        }
+        assert!(compare(entries, 19, &targets));
+    }
+
+    #[test]
+    fn indexes_with_wide_bounds_keep_their_64_bit_spaces() {
+        let mut rng = Rng(99);
+        // Past the narrow bound, below the point where 64-bit sums wrap.
+        let scale = 1 << 29;
+        let entries: Vec<(ParameterPoint, usize)> = (0..300)
+            .map(|id| {
+                let point = ParameterPoint {
+                    coordinates: std::array::from_fn(|_| {
+                        let (a, b) = (rng.range(-scale, scale), rng.range(-scale, scale));
+                        Parameter::new(a.min(b), a.max(b))
+                    }),
+                    offset: 0,
+                };
+                (point, id)
+            })
+            .collect();
+        let index = ClimateIndex::new(entries.clone()).unwrap();
+        assert!(index.narrow.is_empty() && !index.spaces.is_empty());
+        let targets = walk(&mut rng, &entries, 2000, scale);
+        assert!(compare(entries, 19, &targets));
+    }
+
+    #[test]
+    fn quantize_matches_the_wide_conversion() {
+        let mut rng = Rng(7);
+        let mut cases = vec![
+            0.0,
+            -0.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MAX,
+            f32::MIN,
+            214_748.36,
+            214_748.35,
+            -214_748.36,
+            -214_748.37,
+            214_748.3647,
+            -214_748.3648,
+        ];
+        cases.extend((0..20_000).map(|_| f32::from_bits(rng.next() as u32)));
+        cases.extend((0..20_000).map(|_| (rng.next() % 500_000) as f32 / 1000.0 - 250.0));
+        for v in cases {
+            assert_eq!(
+                crate::worldgen::climate::quantize(v),
+                (v * 10_000.0) as i64,
+                "{v}"
+            );
+        }
     }
 }

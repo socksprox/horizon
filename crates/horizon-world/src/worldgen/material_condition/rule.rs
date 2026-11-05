@@ -243,7 +243,9 @@ where
             } => {
                 // A non-positive density returns before the vein's
                 // positional random is drawn: nothing else is consumed.
-                if low > high || facts.high < *low || facts.low > *high {
+                // `!facts.veins`: the column's sampled density is at most
+                // zero all the way (`MaterialConditions::veins_possible`).
+                if !facts.veins || low > high || facts.high < *low || facts.low > *high {
                     return Self::Empty;
                 }
                 Self::OreVein {
@@ -344,6 +346,24 @@ where
             Self::Empty | Self::OreVein { .. } | Self::Condition { .. } => false,
         }
     }
+    /// The first density of every ore vein in this rule: a vein produces
+    /// nothing at a position where it is at most zero.
+    fn vein_gates(&self, gates: &mut Vec<usize>) {
+        match self {
+            Self::OreVein { densities, .. } => {
+                if !gates.contains(&densities[0]) {
+                    gates.push(densities[0]);
+                }
+            }
+            Self::Condition { rule, .. } => rule.vein_gates(gates),
+            Self::Sequence(children) => {
+                for child in children {
+                    child.vein_gates(gates);
+                }
+            }
+            Self::Empty | Self::Block(_) | Self::Bandlands => {}
+        }
+    }
     /// The first y of each band in which this rule specialises differently
     /// from the band below, unordered, and whether the preliminary surface is
     /// asked for.
@@ -424,6 +444,11 @@ pub struct SurfaceVariants {
     /// `surface`): the variant's rule index once made, `Some(None)` when it
     /// gives no block.
     rules: Vec<Option<Option<usize>>>,
+    /// The same variants without their ore veins, for columns where none can
+    /// produce a block (empty when the rule has no veins).
+    plain: Vec<Option<Option<usize>>>,
+    /// The density of each vein (`MaterialConditions::veins_possible`).
+    pub gates: Vec<usize>,
     pub surface: bool,
 }
 impl SurfaceVariants {
@@ -458,33 +483,50 @@ where
         rule.inputs(&mut starts, &mut surface);
         starts.sort_unstable();
         starts.dedup();
+        let mut gates = Vec::new();
+        rule.vein_gates(&mut gates);
         let sides = if surface { 2 } else { 1 };
+        let slots = (starts.len() + 1) * sides;
         Ok(SurfaceVariants {
             base: index,
-            rules: vec![None; (starts.len() + 1) * sides],
+            rules: vec![None; slots],
+            plain: if gates.is_empty() {
+                Vec::new()
+            } else {
+                vec![None; slots]
+            },
+            gates,
             starts,
             surface,
         })
     }
     /// The rule index of the variant for `band`, `above` the preliminary
-    /// surface (ignored unless `variants.surface`), or `None` when it gives
-    /// no block at any position of the band.
+    /// surface (ignored unless `variants.surface`), with its ore veins unless
+    /// `veins` is false, or `None` when it gives no block at any position of
+    /// the band.
     #[inline]
     pub fn surface_variant(
         &mut self,
         variants: &mut SurfaceVariants,
         band: usize,
         above: bool,
+        veins: bool,
     ) -> Option<usize> {
         let slot = if variants.surface {
             band * 2 + usize::from(above)
         } else {
             band
         };
-        if let Some(rule) = variants.rules[slot] {
+        let veins = veins || variants.plain.is_empty();
+        let made = if veins {
+            variants.rules[slot]
+        } else {
+            variants.plain[slot]
+        };
+        if let Some(rule) = made {
             return rule;
         }
-        self.make_surface_variant(variants, band, above, slot)
+        self.make_surface_variant(variants, band, above, veins, slot)
     }
     #[cold]
     fn make_surface_variant(
@@ -492,6 +534,7 @@ where
         variants: &mut SurfaceVariants,
         band: usize,
         above: bool,
+        veins: bool,
         slot: usize,
     ) -> Option<usize> {
         let [low, high] = variants.band_bounds(band);
@@ -499,6 +542,7 @@ where
             low,
             high,
             above_surface: variants.surface.then_some(above),
+            veins,
         };
         let rule = match self.rules[variants.base].specialize(facts) {
             CompiledRule::Empty => None,
@@ -507,7 +551,11 @@ where
                 Some(self.rules.len() - 1)
             }
         };
-        variants.rules[slot] = Some(rule);
+        if veins {
+            variants.rules[slot] = Some(rule);
+        } else {
+            variants.plain[slot] = Some(rule);
+        }
         rule
     }
 }
@@ -655,6 +703,37 @@ impl<R: RandomSource, S: MaterialSurfaceQueries> MaterialConditions<R, S> {
         let index = self.rules.len();
         self.rules.push(compiled);
         Ok(index)
+    }
+    /// Sample the first y-slice of each of `gates` now: a density that fails
+    /// does so before the first column is built.
+    pub fn prepare_densities(&mut self, gates: &[usize]) -> Result<(), MaterialRuleError> {
+        for &gate in gates {
+            self.context.surface.prepare_density(gate)?;
+        }
+        Ok(())
+    }
+    /// Whether an ore vein can produce a block anywhere in the column (`x`,
+    /// `y_lo..=y_hi`, `z`): `false` only when every vein's density is known to
+    /// be at most zero there, so that the rules without veins give each of its
+    /// blocks what the whole rule would.
+    pub fn veins_possible(
+        &mut self,
+        gates: &[usize],
+        x: i32,
+        z: i32,
+        y_lo: i32,
+        y_hi: i32,
+    ) -> Result<bool, MaterialRuleError> {
+        for &gate in gates {
+            if !self
+                .context
+                .surface
+                .density_nonpositive(gate, x, z, y_lo, y_hi)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
     /// Predicates read the worker's updated context. Position arguments are
     /// forwarded to block-producing rules independently, as in vanilla.

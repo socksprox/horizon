@@ -216,6 +216,51 @@ impl RegionFile {
     /// and only then are its old sectors freed. The other chunks stay where
     /// they are. A chunk's last sector is padded with zeros.
     pub fn write(&mut self, chunk: ChunkPos, record: &ChunkRecord) -> io::Result<()> {
+        self.write_many(&[(chunk, record)])
+    }
+
+    /// `write` for several chunks of this region: every record's sectors
+    /// go out first, then the header is written once (8 KB, instead of
+    /// once per chunk) and the replaced sectors are freed. Each chunk
+    /// keeps `write`'s ordering — data, then the header that points to
+    /// it, then the old sectors — so a failure part-way publishes the
+    /// records written before it and returns the error.
+    pub fn write_many(&mut self, records: &[(ChunkPos, &ChunkRecord)]) -> io::Result<()> {
+        let mut placed: Vec<(u32, Option<PathBuf>)> = Vec::with_capacity(records.len());
+        let mut failure = None;
+        for &(chunk, record) in records {
+            match self.write_data(chunk, record) {
+                Ok(done) => placed.push(done),
+                Err(e) => {
+                    failure = Some(e);
+                    break;
+                }
+            }
+        }
+        if !placed.is_empty() {
+            self.write_header()?;
+            for (old, stale_external) in placed {
+                if let Some(path) = stale_external {
+                    remove_if_exists(&path)?;
+                }
+                if old != 0 {
+                    self.free((old >> 8) as usize, (old & 255) as usize);
+                }
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// `write`'s data half: the chunk's sectors (or its external file)
+    /// are on disk and `offsets`/`timestamps` name them; the header is
+    /// not written and the old sectors are not freed. Returns the
+    /// replaced offset and, for an inline record, the external file the
+    /// header write must then clear.
+    fn write_data(
+        &mut self,
+        chunk: ChunkPos,
+        record: &ChunkRecord,
+    ) -> io::Result<(u32, Option<PathBuf>)> {
         let i = slot(self.position, chunk)?;
         if record.compressed.len() > MAX_COMPRESSED {
             return Err(invalid("compressed chunk limit exceeded"));
@@ -264,14 +309,7 @@ impl RegionFile {
         let old = self.offsets[i];
         self.offsets[i] = (start as u32) << 8 | sectors as u32;
         self.timestamps[i] = record.timestamp;
-        self.write_header()?;
-        if !external {
-            remove_if_exists(&external_file)?;
-        }
-        if old != 0 {
-            self.free((old >> 8) as usize, (old & 255) as usize);
-        }
-        Ok(())
+        Ok((old, (!external).then_some(external_file)))
     }
 
     /// `RegionFile.clear`: the chunk is gone; `timestamp` marks when.

@@ -17,9 +17,9 @@ pub struct BlockInfo {
 pub struct JigsawInfo {
     pub info: BlockInfo,
     pub rollable: bool,
-    pub name: String,
-    pub pool: String,
-    pub target: String,
+    pub name: Arc<str>,
+    pub pool: Arc<str>,
+    pub target: Arc<str>,
     pub placement_priority: i32,
     pub selection_priority: i32,
 }
@@ -238,7 +238,7 @@ impl StructureTemplate {
                                 + jigsaws
                                     .iter()
                                     .map(|j| {
-                                        j.name.capacity() + j.pool.capacity() + j.target.capacity()
+                                        j.name.len() + j.pool.len() + j.target.len()
                                     })
                                     .sum::<usize>()
                         })
@@ -259,6 +259,147 @@ impl StructureTemplate {
             palettes: Vec::new(),
             entities: Vec::new(),
         }
+    }
+        /// The `SKYT` digest's magic + version — a `skyline-data.bin` template
+    /// section's flat form. The palette is already resolved to
+    /// [`BlockStateId`]s (the bin is keyed to the same prepared data), so a
+    /// decode is a bounds-checked memcpy where `from_nbt` re-ran
+    /// `read_state` per palette entry — ~2/3 of a template load's cost on
+    /// a small host. Only block-entity and entity compounds keep NBT
+    /// (written through the same [`crate::nbt`] codec), and the palettes'
+    /// `jigsaws` stay lazy.
+    pub const DIGEST_MAGIC: [u8; 4] = *b"SKYT";
+    /// Serialize `self` in [`DIGEST_MAGIC`](Self::DIGEST_MAGIC) form.
+    /// `location` is the loader's key, not the template's — it round-trips
+    /// empty like [`from_nbt`](Self::from_nbt) produces.
+    pub fn to_digest(&self) -> Vec<u8> {
+        fn push_str(out: &mut Vec<u8>, tag: &Compound) {
+            let named = crate::nbt::NamedTag {
+                name: Default::default(),
+                tag: Tag::Compound(tag.clone()),
+            };
+            let bytes = crate::nbt::write_named(&named, crate::nbt::Limits::templates())
+                .unwrap_or_default();
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(&bytes);
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&Self::DIGEST_MAGIC);
+        out.extend_from_slice(&1u32.to_le_bytes());
+        for v in self.size {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&(self.entities.len() as u32).to_le_bytes());
+        for e in &self.entities {
+            for v in e.pos {
+                out.extend_from_slice(&v.to_bits().to_le_bytes());
+            }
+            for v in e.block_pos {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            push_str(&mut out, &e.nbt);
+        }
+        out.extend_from_slice(&(self.palettes.len() as u32).to_le_bytes());
+        for palette in &self.palettes {
+            out.extend_from_slice(&(palette.blocks.len() as u32).to_le_bytes());
+            for b in &palette.blocks {
+                for v in b.pos {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                out.extend_from_slice(&b.state.0.to_le_bytes());
+                match &b.nbt {
+                    Some(nbt) => push_str(&mut out, nbt),
+                    None => out.extend_from_slice(&0u32.to_le_bytes()),
+                }
+            }
+        }
+        out
+    }
+    /// The [`to_digest`](Self::to_digest) inverse; `None` on a truncated
+    /// or malformed payload (the loader then falls through to the `.nbt`
+    /// path — a digest never changes what a template is, only how fast it
+    /// loads).
+    pub fn from_digest(bytes: &[u8]) -> Option<Self> {
+        struct Cur<'a> {
+            bytes: &'a [u8],
+            at: usize,
+        }
+        impl Cur<'_> {
+            fn take(&mut self, n: usize) -> Option<&[u8]> {
+                let s = self.bytes.get(self.at..self.at + n)?;
+                self.at += n;
+                Some(s)
+            }
+            fn u32(&mut self) -> Option<u32> {
+                Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+            }
+            fn i32(&mut self) -> Option<i32> {
+                Some(i32::from_le_bytes(self.take(4)?.try_into().ok()?))
+            }
+            fn i32x3(&mut self) -> Option<[i32; 3]> {
+                Some([self.i32()?, self.i32()?, self.i32()?])
+            }
+            fn compound(&mut self) -> Option<Compound> {
+                let len = self.u32()? as usize;
+                let raw = self.take(len)?;
+                let (named, _) =
+                    crate::nbt::read_named(raw, crate::nbt::Limits::templates()).ok()?;
+                match named.tag {
+                    Tag::Compound(c) => Some(c),
+                    _ => None,
+                }
+            }
+        }
+        let mut cur = Cur { bytes, at: 0 };
+        if cur.take(4)? != Self::DIGEST_MAGIC || cur.u32()? != 1 {
+            return None;
+        }
+        let size = cur.i32x3()?;
+        let mut entities = Vec::new();
+        for _ in 0..cur.u32()? {
+            let mut pos = [0.0; 3];
+            for v in &mut pos {
+                *v = f64::from_bits(u64::from_le_bytes(cur.take(8)?.try_into().ok()?));
+            }
+            entities.push(EntityInfo {
+                pos,
+                block_pos: cur.i32x3()?,
+                nbt: cur.compound()?,
+            });
+        }
+        let mut palettes = Vec::new();
+        for _ in 0..cur.u32()? {
+            let mut blocks = Vec::new();
+            for _ in 0..cur.u32()? {
+                let pos = cur.i32x3()?;
+                let state = BlockStateId(cur.u32()?);
+                let nbt = if cur.u32()? == 0 {
+                    None
+                } else {
+                    // The length was already read for the `== 0` check —
+                    // step back and take it again with the payload.
+                    cur.at -= 4;
+                    Some(cur.compound()?)
+                };
+                blocks.push(BlockInfo { pos, state, nbt });
+            }
+            palettes.push(Palette {
+                blocks,
+                jigsaws: OnceLock::new(),
+            });
+        }
+        Some(Self {
+            location: "".into(),
+            size,
+            palettes,
+            entities,
+        })
+    }
+    /// Whether `bytes` is a [`to_digest`](Self::to_digest) payload — the
+    /// packed-template check [`super::StructureResources::template`] runs
+    /// before assuming gzipped NBT.
+    pub fn is_digest(bytes: &[u8]) -> bool {
+        bytes.starts_with(&Self::DIGEST_MAGIC)
     }
     /// StructureTemplate.load. Blocks are ordered as vanilla orders them:
     /// full collision blocks, then other blocks, then block entities, each
@@ -388,11 +529,13 @@ impl StructureTemplate {
         &self.palettes
     }
     pub fn size(&self, rotation: Rotation) -> [i32; 3] {
+        Self::rotated_size(self.size, rotation)
+    }
+    /// `size` of a template whose unrotated size is `size`.
+    pub fn rotated_size(size: [i32; 3], rotation: Rotation) -> [i32; 3] {
         match rotation {
-            Rotation::Clockwise90 | Rotation::Counterclockwise90 => {
-                [self.size[2], self.size[1], self.size[0]]
-            }
-            _ => self.size,
+            Rotation::Clockwise90 | Rotation::Counterclockwise90 => [size[2], size[1], size[0]],
+            _ => size,
         }
     }
     pub fn transform(
@@ -440,7 +583,17 @@ impl StructureTemplate {
         pivot: [i32; 3],
         mirror: Mirror,
     ) -> BoundingBox {
-        let delta = [self.size[0] - 1, self.size[1] - 1, self.size[2] - 1];
+        Self::bounding_box_of(self.size, position, rotation, pivot, mirror)
+    }
+    /// `bounding_box` of a template whose unrotated size is `size`.
+    pub fn bounding_box_of(
+        size: [i32; 3],
+        position: [i32; 3],
+        rotation: Rotation,
+        pivot: [i32; 3],
+        mirror: Mirror,
+    ) -> BoundingBox {
+        let delta = [size[0] - 1, size[1] - 1, size[2] - 1];
         let a = Self::transform([0; 3], mirror, rotation, pivot);
         let b = Self::transform(delta, mirror, rotation, pivot);
         BoundingBox::from_corners(a, b).moved(position)
@@ -468,8 +621,8 @@ impl StructureTemplate {
                     let horizontal = jigsaw_states(info.state)?;
                     let nbt = info.nbt.clone().unwrap_or_default();
                     let joint = string(get(&nbt, "joint"));
-                    let text = |key: &str, default: &str| {
-                        string(get(&nbt, key)).unwrap_or_else(|| default.to_owned())
+                    let text = |key: &str, default: &str| -> Arc<str> {
+                        string(get(&nbt, key)).map_or_else(|| default.into(), Into::into)
                     };
                     let int = |key: &str| match get(&nbt, key) {
                         Some(Tag::Int(v)) => *v,
@@ -556,8 +709,9 @@ mod save_tests {
             std::path::Path::new("/nonexistent"),
             Default::default(),
             &Default::default(),
-        )
-        .with_pack_templates([("p:room/a".to_owned(), file.into())].into());
+            None,
+            [("p:room/a".to_owned(), file.into())].into(),
+        );
         assert_eq!(resources.template("p:room/a").unwrap().size, [3, 1, 2]);
         assert_eq!(resources.template("p:room/b").unwrap().size, [0, 0, 0]);
     }

@@ -9,7 +9,16 @@ pub use index::{ClimateIndex, ClimateSearch, IndexError, Parameter, ParameterPoi
 
 /// Vanilla multiplies in float precision before the saturating Java long cast.
 pub fn quantize(value: f32) -> i64 {
-    (value * 10_000.0) as i64
+    let scaled = value * 10_000.0;
+    // `as i32` truncates and saturates like `as i64` (NaN is 0 for both); it is
+    // one hardware conversion where `as i64` is a library call on 32-bit ARM.
+    // Short of the i32 limits it is the same number; at them, convert wide.
+    let narrow = scaled as i32;
+    if narrow != i32::MIN && narrow != i32::MAX {
+        i64::from(narrow)
+    } else {
+        scaled as i64
+    }
 }
 pub fn unquantize(value: i64) -> f32 {
     value as f32 / 10_000.0

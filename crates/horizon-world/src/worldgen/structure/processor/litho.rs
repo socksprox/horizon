@@ -451,7 +451,7 @@ mod tests {
 
     struct Lists {
         registry: &'static BlockRegistry,
-        resources: StructureResources,
+        resources: std::sync::Arc<StructureResources>,
     }
     impl Lists {
         fn new(lists: &[(&str, Value)]) -> Self {
@@ -465,6 +465,8 @@ mod tests {
                 std::path::Path::new("/nonexistent"),
                 lists,
                 &BTreeMap::new(),
+                None,
+                BTreeMap::new(),
             );
             Self {
                 registry,

@@ -115,8 +115,14 @@ impl SamplerContext {
             self.scratch.push(buffer);
             return Err(SampleError::Alloc);
         }
-        buffer.resize(size, 0.0);
-        let result = sample(self, &mut buffer);
+        // Grow, never shrink: a pooled buffer keeps its high-water length, so
+        // alternating small and large requests do not re-zero the large one's
+        // tail each time. Its contents were never specified (a reused buffer
+        // holds the previous user's values); the sampler writes all `size`.
+        if buffer.len() < size {
+            buffer.resize(size, 0.0);
+        }
+        let result = sample(self, &mut buffer[..size]);
         self.scratch.push(buffer);
         result
     }

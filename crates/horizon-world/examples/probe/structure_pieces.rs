@@ -38,7 +38,7 @@ pub fn registry(resources: &Path) -> Result<&'static BlockRegistry, Error> {
 fn element(element: &PoolElement) -> String {
     match element {
         PoolElement::Empty => "empty".into(),
-        PoolElement::Single { template, .. } => template.location.to_string(),
+        PoolElement::Single { template, .. } => template.location().to_string(),
         PoolElement::Feature { feature, .. } => format!("feature:{feature}"),
         PoolElement::List { elements, .. } => {
             let parts: Vec<_> = elements.iter().map(self::element).collect();

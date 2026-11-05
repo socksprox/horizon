@@ -47,6 +47,26 @@ pub trait MaterialSurfaceQueries {
     fn preliminary_surface(&mut self, _position: BlockPos) -> Result<f32, MaterialRuleError> {
         Err(MaterialRuleError::MissingDensityProvider)
     }
+    /// Make bound density `index` ready to read at the blocks of its first
+    /// y-slice (where a bulk-sampling provider reports a failing density,
+    /// ahead of the first block rather than in the middle of the chunk).
+    fn prepare_density(&mut self, _index: usize) -> Result<(), MaterialRuleError> {
+        Ok(())
+    }
+    /// Whether bound density `index` is known to be at most zero at every
+    /// block of the column (`x`, `y_lo..=y_hi`, `z`). `false` when it is not
+    /// or cannot be told (NaN counts as not at most zero), which is all a
+    /// provider without bulk samples has to answer.
+    fn density_nonpositive(
+        &mut self,
+        _index: usize,
+        _x: i32,
+        _z: i32,
+        _y_lo: i32,
+        _y_hi: i32,
+    ) -> Result<bool, MaterialRuleError> {
+        Ok(false)
+    }
     fn possible_biomes(&self) -> Option<BTreeSet<String>> {
         None
     }
@@ -101,6 +121,19 @@ impl<T: MaterialSurfaceQueries + ?Sized> MaterialSurfaceQueries for &mut T {
     }
     fn preliminary_surface(&mut self, position: BlockPos) -> Result<f32, MaterialRuleError> {
         (**self).preliminary_surface(position)
+    }
+    fn prepare_density(&mut self, index: usize) -> Result<(), MaterialRuleError> {
+        (**self).prepare_density(index)
+    }
+    fn density_nonpositive(
+        &mut self,
+        index: usize,
+        x: i32,
+        z: i32,
+        y_lo: i32,
+        y_hi: i32,
+    ) -> Result<bool, MaterialRuleError> {
+        (**self).density_nonpositive(index, x, z, y_lo, y_hi)
     }
     fn possible_biomes(&self) -> Option<BTreeSet<String>> {
         (**self).possible_biomes()
@@ -333,6 +366,9 @@ pub struct Facts {
     pub low: i32,
     pub high: i32,
     pub above_surface: Option<bool>,
+    /// Whether an ore vein rule may produce a block. `false` where every
+    /// vein's density is at most zero, which is when they produce none.
+    pub veins: bool,
 }
 impl<R: RandomSource> Clone for Kind<R>
 where

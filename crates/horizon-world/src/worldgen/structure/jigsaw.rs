@@ -40,11 +40,80 @@ impl Projection {
         }
     }
 }
+/// A single element's template. A pool element decoded from data holds only
+/// the template's id and fetches the template through
+/// `StructureResources::template`'s bounded cache whenever it needs it: a
+/// decoded pool or a cached structure start would otherwise pin every
+/// template it ever listed (a village's pools ~4 MB, trial chambers ~11 MB)
+/// for as long as the pool or the start lives. A template evicted from that
+/// cache loads again, identical, from its file.
+#[derive(Clone, Debug)]
+pub enum TemplateRef {
+    /// A template already in hand (built in place).
+    Loaded(Arc<StructureTemplate>),
+    /// A template read by id on use. `size` remembers its unrotated size:
+    /// assembly asks it of every candidate far more often than it needs
+    /// the blocks.
+    Lazy {
+        location: Arc<str>,
+        resources: Arc<StructureResources>,
+        size: OnceLock<[i32; 3]>,
+    },
+}
+impl TemplateRef {
+    fn lazy(resources: &StructureResources, location: &str) -> Self {
+        Self::Lazy {
+            location: if location.contains(':') {
+                location.into()
+            } else {
+                format!("minecraft:{location}").into()
+            },
+            resources: resources.arc(),
+            size: OnceLock::new(),
+        }
+    }
+    /// The template (missing ones read as empty, as `template` says).
+    pub fn get(&self) -> Arc<StructureTemplate> {
+        match self {
+            Self::Loaded(template) => template.clone(),
+            Self::Lazy {
+                location,
+                resources,
+                ..
+            } => resources
+                .template(location)
+                .unwrap_or_else(|| Arc::new(StructureTemplate::empty())),
+        }
+    }
+    /// The template's unrotated size, without keeping the template.
+    pub fn size(&self) -> [i32; 3] {
+        match self {
+            Self::Loaded(template) => template.size,
+            Self::Lazy {
+                size,
+                location,
+                resources,
+            } => *size.get_or_init(|| resources.template_meta(location).size),
+        }
+    }
+    /// The id the template loads under.
+    pub fn location(&self) -> &str {
+        match self {
+            Self::Loaded(template) => &template.location,
+            Self::Lazy { location, .. } => location,
+        }
+    }
+}
+impl From<Arc<StructureTemplate>> for TemplateRef {
+    fn from(template: Arc<StructureTemplate>) -> Self {
+        Self::Loaded(template)
+    }
+}
 #[derive(Clone, Debug)]
 pub enum PoolElement {
     Empty,
     Single {
-        template: Arc<StructureTemplate>,
+        template: TemplateRef,
         processors: ProcessorList,
         /// The element's `processors` as written: a list id or an inline list,
         /// saved back as it was.
@@ -69,14 +138,14 @@ pub enum PoolElement {
     },
 }
 #[derive(Clone, Debug)]
-pub struct Jigsaw<'a> {
+pub struct Jigsaw {
     pub pos: [i32; 3],
     pub front: Direction,
     pub top: Direction,
     pub rollable: bool,
-    pub name: Option<std::borrow::Cow<'a, str>>,
-    pub pool: std::borrow::Cow<'a, str>,
-    pub target: std::borrow::Cow<'a, str>,
+    pub name: Option<Arc<str>>,
+    pub pool: Arc<str>,
+    pub target: Arc<str>,
     pub placement_priority: i32,
     pub selection_priority: i32,
 }
@@ -146,9 +215,7 @@ impl PoolElement {
                     .as_str()
                     .ok_or(DecodeError::Field("location"))?;
                 Self::Single {
-                    template: resources.template(location).ok_or_else(|| {
-                        DecodeError::Registry(format!("missing template {location}"))
-                    })?,
+                    template: TemplateRef::lazy(resources, location),
                     processors: ProcessorList::decode(
                         &value["processors"].to_string(),
                         resources,
@@ -217,7 +284,7 @@ impl PoolElement {
                 };
                 let mut entries = vec![
                     ("element_type", text(kind)),
-                    ("location", text(&template.location)),
+                    ("location", text(template.location())),
                     (
                         "processors",
                         super::processor::json_to_nbt(processors_source),
@@ -266,7 +333,9 @@ impl PoolElement {
     pub fn size(&self, rotation: Rotation) -> [i32; 3] {
         match self {
             Self::Empty | Self::Feature { .. } => [0; 3],
-            Self::Single { template, .. } => template.size(rotation),
+            Self::Single { template, .. } => {
+                StructureTemplate::rotated_size(template.size(), rotation)
+            }
             Self::List { elements, .. } => elements.iter().fold([0; 3], |acc, e| {
                 let s = e.size(rotation);
                 std::array::from_fn(|i| acc[i].max(s[i]))
@@ -277,9 +346,13 @@ impl PoolElement {
         match self {
             Self::Empty => BoundingBox::new(position, position),
             Self::Feature { .. } => BoundingBox::new(position, position),
-            Self::Single { template, .. } => {
-                template.bounding_box(position, rotation, [0; 3], Mirror::None)
-            }
+            Self::Single { template, .. } => StructureTemplate::bounding_box_of(
+                template.size(),
+                position,
+                rotation,
+                [0; 3],
+                Mirror::None,
+            ),
             Self::List { elements, .. } => {
                 let mut boxes = elements
                     .iter()
@@ -294,13 +367,13 @@ impl PoolElement {
         }
     }
     /// getShuffledJigsawBlocks.
-    pub fn shuffled_jigsaws<'a>(
-        &'a self,
+    pub fn shuffled_jigsaws(
+        &self,
         resources: &StructureResources,
         position: [i32; 3],
         rotation: Rotation,
         random: &mut impl RandomSource,
-    ) -> Vec<Jigsaw<'a>> {
+    ) -> Vec<Jigsaw> {
         match self {
             Self::Empty => Vec::new(),
             Self::Feature { .. } => vec![Jigsaw {
@@ -319,7 +392,29 @@ impl PoolElement {
                 .map(|e| e.shuffled_jigsaws(resources, position, rotation, random))
                 .unwrap_or_default(),
             Self::Single { template, .. } => {
-                let mut jigsaws = template_jigsaws(resources, template, position, rotation);
+                let mut jigsaws = match template {
+                    TemplateRef::Loaded(template) => {
+                        let states = |state| resources.jigsaw_horizontal(state);
+                        template_jigsaws(
+                            resources,
+                            template.palettes().len(),
+                            |palette| template.jigsaws(palette, &states),
+                            position,
+                            rotation,
+                        )
+                    }
+                    // Assembly needs the size and the jigsaws, not the blocks.
+                    TemplateRef::Lazy { location, .. } => {
+                        let meta = resources.template_meta(location);
+                        template_jigsaws(
+                            resources,
+                            meta.palette_count(),
+                            |palette| meta.jigsaws(palette),
+                            position,
+                            rotation,
+                        )
+                    }
+                };
                 shuffle(&mut jigsaws, random);
                 jigsaws.sort_by_key(|j| std::cmp::Reverse(j.selection_priority));
                 jigsaws
@@ -345,11 +440,12 @@ impl PoolElement {
 /// StructureTemplate.getJigsaws: palette chosen by a position-seeded random.
 fn template_jigsaws<'a>(
     resources: &StructureResources,
-    template: &'a StructureTemplate,
+    palettes: usize,
+    jigsaws: impl Fn(usize) -> &'a [super::template::JigsawInfo],
     position: [i32; 3],
     rotation: Rotation,
-) -> Vec<Jigsaw<'a>> {
-    if template.palettes().is_empty() {
+) -> Vec<Jigsaw> {
+    if palettes == 0 {
         return Vec::new();
     }
     let palette = LegacyRandom::new(position_seed(BlockPos::new(
@@ -357,10 +453,9 @@ fn template_jigsaws<'a>(
         position[1],
         position[2],
     )))
-    .next_int_bound(template.palettes().len() as i32)
+    .next_int_bound(palettes as i32)
     .unwrap_or(0) as usize;
-    template
-        .jigsaws(palette, &|state| resources.jigsaw_horizontal(state))
+    jigsaws(palette)
         .iter()
         .map(|j| {
             let relative = StructureTemplate::transform(j.info.pos, Mirror::None, rotation, [0; 3]);
@@ -376,9 +471,9 @@ fn template_jigsaws<'a>(
                 front: direction(front),
                 top: direction(top),
                 rollable: j.rollable,
-                name: Some(std::borrow::Cow::Borrowed(&j.name)),
-                pool: std::borrow::Cow::Borrowed(&j.pool),
-                target: std::borrow::Cow::Borrowed(&j.target),
+                name: Some(j.name.clone()),
+                pool: j.pool.clone(),
+                target: j.target.clone(),
                 placement_priority: j.placement_priority,
                 selection_priority: j.selection_priority,
             }
@@ -533,6 +628,13 @@ impl Pools {
             raw,
             decoded: RwLock::new(HashMap::new()),
         }
+    }
+    /// Drop the decoded pools — each pins the templates of all its elements,
+    /// so a long walk past new structures grew without bound. A pool is
+    /// decoded again (same result) the next time a structure asks for it;
+    /// an assembly in flight keeps the `Arc`s it already holds.
+    pub fn release(&self) {
+        *self.decoded.write().unwrap() = HashMap::new();
     }
     pub fn get(
         &self,
@@ -848,7 +950,7 @@ fn place_element<W: FeatureWorld + PlacementContext, R: RandomSource>(
             place_in_world(
                 world,
                 resources,
-                template,
+                &template.get(),
                 position,
                 reference,
                 &mut settings,
@@ -1347,7 +1449,7 @@ impl Placer<'_, '_> {
             let Some(target_pool) = self.pool(&jigsaw.pool) else {
                 continue;
             };
-            if target_pool.templates.is_empty() && jigsaw.pool != "minecraft:empty" {
+            if target_pool.templates.is_empty() && &*jigsaw.pool != "minecraft:empty" {
                 continue;
             }
             let Some(fallback) = self.pool(&target_pool.fallback) else {

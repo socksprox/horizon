@@ -206,7 +206,7 @@ fn ore_veins_are_dropped_from_the_bands_where_their_density_is_never_positive() 
     ] {
         let band = variants.band(y);
         assert_eq!(
-            w.surface_variant(&mut variants, band, false).is_some(),
+            w.surface_variant(&mut variants, band, false, true).is_some(),
             kept,
             "{y}"
         );
@@ -220,7 +220,7 @@ fn ore_veins_are_dropped_from_the_bands_where_their_density_is_never_positive() 
         .unwrap();
     let mut variants = w.surface_variants(rule).unwrap();
     let band = variants.band(64);
-    let variant = w.surface_variant(&mut variants, band, false).unwrap();
+    let variant = w.surface_variant(&mut variants, band, false, true).unwrap();
     w.update_xz(0, 0, 0, 0);
     w.update_y(1, 1, i32::MIN, 64);
     // The vein's density is not asked for where it cannot be positive.
