@@ -2375,6 +2375,56 @@ where
             entities: Vec::new(),
         })
     }
+    /// The `generate` chunk shell minus everything a saved overlay
+    /// rewrites: the centre's biome chunk and the structure starts (an
+    /// undecorated restore still places its own starts), but no noise
+    /// fill, surface rules, carvers or heightmap priming. Skyline fills
+    /// the terrain from its `.mca` record — a block copy instead of the
+    /// full pipeline, which is what a saved chunk's regen was anyway.
+    fn empty_proto(
+        &self,
+        worker: &mut WorkerState,
+        pos: ChunkPos,
+    ) -> Result<ProtoChunk, GeneratorError> {
+        let data = &self.data;
+        // Only the centre biome chunk reaches `ProtoChunk.biomes`; the
+        // eight neighbours `generate` builds feed the surface rules it
+        // isn't running.
+        let biomes = (*self.biome_chunk(worker, pos)?).clone();
+        let mut chunk = TerrainChunk::new(
+            pos,
+            self.settings.level_min_y,
+            self.settings.level_height,
+            data.registry,
+            data.states.clone(),
+        )
+        .map_err(stage("empty"))?;
+        chunk.set_generation_stage(PreLightChunkStage::Terrain);
+        let (references, own_starts) = match &self.structures {
+            Some(structures) => {
+                let mut queries = StructureQueries {
+                    pipeline: self,
+                    worker,
+                    valid: BTreeSet::new(),
+                };
+                (
+                    structures.references(&mut queries, pos),
+                    structures.starts_at(&mut queries, pos),
+                )
+            }
+            None => (Vec::new(), Starts::default()),
+        };
+        Ok(ProtoChunk {
+            terrain: chunk,
+            biomes,
+            data: data.clone(),
+            decorated: false,
+            block_entities: Vec::new(),
+            structure_starts: references,
+            own_starts,
+            entities: Vec::new(),
+        })
+    }
 }
 
 impl<R: RandomSource> Pipeline<R>
@@ -2998,6 +3048,12 @@ trait SeededPipeline: Send + Sync {
         worker: &mut WorkerState,
         pos: ChunkPos,
     ) -> Result<ProtoChunk, GeneratorError>;
+    /// [`Pipeline::empty_proto`]: the shell a saved overlay completes.
+    fn empty_proto(
+        &self,
+        worker: &mut WorkerState,
+        pos: ChunkPos,
+    ) -> Result<ProtoChunk, GeneratorError>;
     fn decorate(
         &self,
         worker: &mut WorkerState,
@@ -3113,6 +3169,13 @@ where
         pos: ChunkPos,
     ) -> Result<ProtoChunk, GeneratorError> {
         Pipeline::generate(self, worker, pos)
+    }
+    fn empty_proto(
+        &self,
+        worker: &mut WorkerState,
+        pos: ChunkPos,
+    ) -> Result<ProtoChunk, GeneratorError> {
+        Pipeline::empty_proto(self, worker, pos)
     }
     fn decorate(
         &self,
@@ -4367,6 +4430,28 @@ impl GeneratorWorker {
         let result = self.pipeline.generate(&mut self.state, pos);
         let marked = horizon_core::alloc::take();
         self.state.timings.chunks += 1;
+        if marked && result.is_err() {
+            return Ok(None);
+        }
+        result.map(Some)
+    }
+    /// The `generate_proto` shell minus the stages a saved overlay
+    /// rewrites: centre biomes and structure starts, empty terrain.
+    /// Skyline restores `.mca` records and live columns onto it, turning
+    /// a visited chunk's stream job into a block copy instead of a full
+    /// regeneration.
+    pub fn empty_proto(&mut self, pos: ChunkPos) -> Result<ProtoChunk, GeneratorError> {
+        self.pipeline.empty_proto(&mut self.state, pos)
+    }
+    /// `empty_proto` with `try_generate_proto`'s fallible-growth mark:
+    /// `Ok(None)` when a `try_reserve` failed mid-build.
+    pub fn try_empty_proto(
+        &mut self,
+        pos: ChunkPos,
+    ) -> Result<Option<ProtoChunk>, GeneratorError> {
+        horizon_core::alloc::clear();
+        let result = self.pipeline.empty_proto(&mut self.state, pos);
+        let marked = horizon_core::alloc::take();
         if marked && result.is_err() {
             return Ok(None);
         }
