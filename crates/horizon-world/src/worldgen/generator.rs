@@ -3134,6 +3134,15 @@ trait SeededPipeline: Send + Sync {
         side: usize,
         approximate: bool,
     ) -> Result<Vec<LodColumn>, GeneratorError>;
+    fn coarse_surface(
+        &self,
+        worker: &mut WorkerState,
+        x: i32,
+        z: i32,
+        step: i32,
+        side: usize,
+        biome_cell: i32,
+    ) -> Result<Vec<CoarseColumn>, GeneratorError>;
     fn structure_starts(
         &self,
         worker: &mut WorkerState,
@@ -3913,6 +3922,128 @@ where
         }
         Ok(result)
     }
+    fn coarse_surface(
+        &self,
+        _worker: &mut WorkerState,
+        x: i32,
+        z: i32,
+        step: i32,
+        side: usize,
+        biome_cell: i32,
+    ) -> Result<Vec<CoarseColumn>, GeneratorError> {
+        const CELL_Y: i32 = 8;
+        // Corner layers sampled per window around the preliminary surface.
+        const WINDOW: i32 = 5;
+        // The lowest a surface goes below the preliminary one (measured:
+        // caverns under thin roofs otherwise sink columns by up to 70 blocks).
+        const FLOOR: i32 = 8;
+        if step <= 0
+            || step % 4 != 0
+            || x.rem_euclid(4) != 0
+            || z.rem_euclid(4) != 0
+            || side == 0
+            || side > 64
+        {
+            return Err(resource("coarse surface dimensions"));
+        }
+        if self.flat.is_some() {
+            return Err(resource("coarse surface of a superflat world"));
+        }
+        let (min, height) = (self.settings.noise_min_y, self.settings.noise_height);
+        let layers = height / CELL_Y + 1;
+        let mut context = SamplerContext::sparse();
+        // The preliminary surface (the initial density without jaggedness,
+        // searched down in cell steps) centres each column's search window.
+        let columns = DensityVolume::new([side as i32, 1, side as i32], [x, 0, z], [step, 1, step])
+            .map_err(stage("coarse surface"))?;
+        let mut estimates = vec![0.; columns.size()];
+        self.preliminary
+            .sample_volume(&mut context, &mut estimates, columns)
+            .map_err(stage("coarse surface"))?;
+        let final_density = self.router.get(RouterField::FinalDensity);
+        let mut resolver = self.source.resolver(
+            &self.climate,
+            self.router.get(RouterField::Erosion).as_ref(),
+        );
+        let mut biome_context = SamplerContext::cached();
+        let mut biome_memo = BiomeMemo {
+            biomes: HashMap::new(),
+            cell: biome_cell.max(0),
+        };
+        let mut density = [0f32; WINDOW as usize];
+        let mut out = Vec::with_capacity(side * side);
+        for dz in 0..side {
+            for dx in 0..side {
+                let (wx, wz) = (x + dx as i32 * step, z + dz as i32 * step);
+                let estimate = estimates[dz * side + dx];
+                let estimate = if estimate.is_finite() { estimate as i32 } else { min };
+                let mut hi = ((estimate - min).div_euclid(CELL_Y) + 2).clamp(0, layers - 1);
+                // The density one layer above the window, once known to be air.
+                let mut air_above: Option<f32> = None;
+                let surface = loop {
+                    let lo = (hi - (WINDOW - 1)).max(0);
+                    let n = (hi - lo + 1) as usize;
+                    let volume = DensityVolume::new(
+                        [1, n as i32, 1],
+                        [wx, min + lo * CELL_Y, wz],
+                        [4, CELL_Y, 4],
+                    )
+                    .map_err(stage("coarse surface"))?;
+                    final_density
+                        .sample_volume(&mut context, &mut density[..n], volume)
+                        .map_err(stage("coarse surface"))?;
+                    match density[..n].iter().rposition(|&d| d > 0.) {
+                        // The top sample is solid, with unknown air above it:
+                        // the window moves up (keeping that layer).
+                        Some(j) if j == n - 1 && air_above.is_none() && hi < layers - 1 => {
+                            hi = (hi + WINDOW - 1).min(layers - 1);
+                        }
+                        Some(j) => {
+                            let k = lo + j as i32;
+                            let above = if j + 1 < n {
+                                Some(density[j + 1])
+                            } else if k + 1 < layers {
+                                air_above
+                            } else {
+                                None
+                            };
+                            let base = min + k * CELL_Y;
+                            break match above {
+                                // Solid to the very top of the noise range.
+                                None => base,
+                                // Blocks of the cell are solid while the
+                                // linearly interpolated density is positive.
+                                Some(next) => {
+                                    let top = density[j];
+                                    let blocks = (CELL_Y as f32 * top / (top - next)).ceil();
+                                    base + (blocks as i32).clamp(1, CELL_Y)
+                                }
+                            };
+                        }
+                        None if lo == 0 => break min,
+                        None => {
+                            air_above = Some(density[0]);
+                            hi = lo - 1;
+                        }
+                    }
+                };
+                // A cave under a thin roof reads as deep air at the corners:
+                // the surface stays near the preliminary one.
+                let surface = surface.max(estimate - FLOOR);
+                let sample_y = (surface - 1).max(min);
+                let biome = memo_biome(
+                    &self.data,
+                    &mut resolver,
+                    &mut biome_context,
+                    &mut biome_memo,
+                    self.zoom.quart_at_block(BlockPos::new(wx, sample_y, wz)),
+                )
+                .map_err(stage("coarse biome"))?;
+                out.push(CoarseColumn { height: surface, biome });
+            }
+        }
+        Ok(out)
+    }
     fn noise_biomes(&self, worker: &mut WorkerState, quarts: &[[i32; 3]]) -> Vec<Option<String>> {
         let mut resolver = self.source.resolver(
             &self.climate,
@@ -4453,6 +4584,16 @@ pub struct SurfaceSample {
 
 pub type LodColumn = (Option<SurfaceSample>, Vec<(i32, i32, BlockStateId)>);
 
+/// One column of `GeneratorWorker::coarse_surface`.
+#[derive(Clone, Copy, Debug)]
+pub struct CoarseColumn {
+    /// Exclusive top face of the noise terrain (`noise_min_y` when the
+    /// column holds none); fluids are not considered.
+    pub height: i32,
+    /// The noise biome at the surface.
+    pub biome: BiomeId,
+}
+
 /// Per-thread generation state.
 pub struct GeneratorWorker {
     pipeline: Arc<dyn SeededPipeline>,
@@ -4560,6 +4701,25 @@ impl GeneratorWorker {
     ) -> Result<Vec<LodColumn>, GeneratorError> {
         self.pipeline
             .lod_grid(&mut self.state, x, z, width, side, approximate)
+    }
+    /// Far-terrain height lattice without chunks: the noise terrain's top
+    /// face and biome at `side` x `side` columns `step` blocks apart from
+    /// (`x`, `z`) (both, and `step`, multiples of the 4-block noise cell).
+    /// `FinalDensity` is evaluated at cell corners (8-block layers) around
+    /// the preliminary surface and the zero crossing interpolated inside its
+    /// cell, as chunk generation does between the same corners. No carvers,
+    /// aquifers, surface rules, structures or features. One biome is shared
+    /// per `biome_cell` x `biome_cell` quarts (0 = every column's own).
+    pub fn coarse_surface(
+        &mut self,
+        x: i32,
+        z: i32,
+        step: i32,
+        side: usize,
+        biome_cell: i32,
+    ) -> Result<Vec<CoarseColumn>, GeneratorError> {
+        self.pipeline
+            .coarse_surface(&mut self.state, x, z, step, side, biome_cell)
     }
     pub fn noise_biomes(&mut self, quarts: &[[i32; 3]]) -> Vec<Option<String>> {
         self.pipeline.noise_biomes(&mut self.state, quarts)
