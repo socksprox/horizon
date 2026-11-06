@@ -61,8 +61,9 @@ pub trait ResourceSource {
 }
 /// Horizon's own strings, compiled in so they need no prepared resources.
 struct Bundled;
-impl ResourceSource for Bundled {
-    fn read(&self, path: &str) -> Option<Vec<u8>> {
+impl Bundled {
+    #[cfg(not(target_os = "horizon"))]
+    fn file(path: &str) -> Option<Vec<u8>> {
         let body = match path {
             "assets/horizon/lang/en_us.json" => {
                 include_str!("../../horizon-client/assets/horizon/lang/en_us.json")
@@ -341,6 +342,22 @@ impl ResourceSource for Bundled {
             _ => return None,
         };
         Some(body.as_bytes().to_vec())
+    }
+    /// The 3DS keeps only `en_us` in the binary: every language compiled in
+    /// is 3.6 MB of `.rodata` against a ~124 MB app budget. The others load
+    /// from the resource root's `assets/horizon/lang/` like a pack's would.
+    #[cfg(target_os = "horizon")]
+    fn file(path: &str) -> Option<Vec<u8>> {
+        (path == "assets/horizon/lang/en_us.json").then(|| {
+            include_str!("../../horizon-client/assets/horizon/lang/en_us.json")
+                .as_bytes()
+                .to_vec()
+        })
+    }
+}
+impl ResourceSource for Bundled {
+    fn read(&self, path: &str) -> Option<Vec<u8>> {
+        Self::file(path)
     }
     fn namespaces(&self) -> Vec<String> {
         vec!["horizon".into()]
